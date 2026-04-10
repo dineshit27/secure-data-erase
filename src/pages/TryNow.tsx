@@ -78,6 +78,15 @@ const TryNow = () => (
           </Link>
         ))}
       </div>
+      <div className="mt-10 rounded-xl border border-primary/20 bg-primary/5 p-6 text-center">
+        <h2 className="font-display font-bold text-xl text-text-primary uppercase">Join the Community Intelligence Feed</h2>
+        <p className="text-sm text-text-secondary mt-2 max-w-2xl mx-auto">
+          Follow live cybersecurity news, threat alerts, and top discussions from the SecureDel community.
+        </p>
+        <Link to="/community" className="inline-block mt-4">
+          <CyberButton variant="secondary" size="sm">Open Community</CyberButton>
+        </Link>
+      </div>
     </section>
   </PageWrapper>
 );

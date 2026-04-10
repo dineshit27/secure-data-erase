@@ -9,6 +9,7 @@ const navLinks = [
   { to: "/", label: "Home" },
   { to: "/about", label: "About" },
   { to: "/try-now", label: "Try Now" },
+  { to: "/community", label: "Community" },
   { to: "/contact", label: "Contact" },
 ];
 
@@ -199,6 +200,9 @@ export const Navbar = () => {
 
         {/* Desktop CTA */}
         <div className="hidden md:flex items-center gap-3">
+          <Link to="/subscription">
+            <CyberButton variant="secondary" size="sm" data-testid="button-nav-subscription">Subscription</CyberButton>
+          </Link>
           {loading ? (
             <div className="w-24 h-8 rounded-lg bg-surface animate-pulse" />
           ) : user ? (
@@ -245,6 +249,7 @@ export const Navbar = () => {
                   Home: <Shield className="w-4 h-4 mr-2 inline-block" />,
                   About: <User className="w-4 h-4 mr-2 inline-block" />,
                   "Try Now": <Menu className="w-4 h-4 mr-2 inline-block" />,
+                  Community: <UserCheck className="w-4 h-4 mr-2 inline-block" />,
                   Contact: <LogOut className="w-4 h-4 mr-2 inline-block" />,
                 };
                 return (
@@ -267,6 +272,9 @@ export const Navbar = () => {
               })}
             </div>
             <div className="flex flex-col gap-3 w-full mt-4">
+              <Link to="/subscription" onClick={() => setMobileOpen(false)} className="w-full">
+                <CyberButton variant="secondary" size="sm" className="w-full">Subscription</CyberButton>
+              </Link>
               {user ? (
                 <>
                   <Link to="/profile" onClick={() => setMobileOpen(false)} className="w-full">

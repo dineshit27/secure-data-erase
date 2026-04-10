@@ -9,6 +9,7 @@ import { Link } from "react-router-dom";
 import { PageWrapper } from "@/components/layout/PageWrapper";
 import { CyberButton } from "@/components/ui/CyberButton";
 import { TerminalWindow } from "@/components/ui/TerminalWindow";
+import PrivacyHealthDashboard from "@/components/ui/PrivacyHealthDashboard";
 import { useAuth } from "@/contexts/AuthContext";
 
 const FadeUp = ({ children, delay = 0, className = "" }: { children: React.ReactNode; delay?: number; className?: string }) => (
@@ -156,6 +157,13 @@ const GuestProfile = () => {
             </FadeUp>
           </div>
         </div>
+
+        <FadeUp delay={0.25} className="mt-6">
+          <PrivacyHealthDashboard
+            heading="Device Privacy Health"
+            subtitle="Track cleanup coverage, active risks, and pending privacy actions in real time."
+          />
+        </FadeUp>
       </div>
     </PageWrapper>
   );
@@ -330,6 +338,13 @@ const Profile = () => {
             </FadeUp>
           </div>
         </div>
+
+        <FadeUp delay={0.3} className="mt-6">
+          <PrivacyHealthDashboard
+            heading="Device Privacy Health"
+            subtitle="Your live privacy health report with score, risk radar, and cleanup recommendations."
+          />
+        </FadeUp>
       </div>
     </PageWrapper>
   );

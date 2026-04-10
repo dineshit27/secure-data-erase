@@ -220,3 +220,75 @@ export async function logClientProgress(input: {
         // Non-blocking telemetry path; ignore failures.
     }
 }
+
+export interface CommunityAnnouncement {
+    id: string;
+    title: string;
+    type: string;
+    summary: string;
+    published_at: string;
+}
+
+export interface CommunityTopic {
+    tag: string;
+    mentions: number;
+    risk: "low" | "medium" | "high" | string;
+}
+
+export interface CommunityDiscussion {
+    id: string;
+    title: string;
+    author: string;
+    replies: number;
+    views: number;
+    last_activity: string;
+}
+
+export interface CommunityNewsItem {
+    title: string;
+    url: string;
+    source: string;
+    published_at: string;
+}
+
+export interface CommunityThreatAlert {
+    id: string;
+    title: string;
+    severity: "low" | "medium" | "high" | "critical" | string;
+    scope: string;
+    published_at: string;
+    description: string;
+}
+
+export interface CommunityPromotedItem {
+    id: string;
+    name: string;
+    category: string;
+    blurb: string;
+    url: string;
+}
+
+export interface CommunityOverview {
+    meta: {
+        generated_at: string;
+        active_members: number;
+        online_now: number;
+        news_items: number;
+    };
+    announcements: CommunityAnnouncement[];
+    trending_topics: CommunityTopic[];
+    most_discussed: CommunityDiscussion[];
+    security_news: CommunityNewsItem[];
+    tip_of_the_day: {
+        day_index: number;
+        text: string;
+        rotates_daily: boolean;
+    };
+    threat_alerts: CommunityThreatAlert[];
+    promoted: CommunityPromotedItem[];
+}
+
+export async function fetchCommunityOverview(limitNews = 8): Promise<CommunityOverview> {
+    const data = await apiGet(`/api/community/overview?limit_news=${encodeURIComponent(String(limitNews))}`);
+    return data as CommunityOverview;
+}

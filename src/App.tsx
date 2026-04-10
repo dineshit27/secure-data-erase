@@ -7,11 +7,14 @@ import { Navbar } from "@/components/layout/Navbar";
 import { Footer } from "@/components/layout/Footer";
 import { CustomCursor } from "@/components/ui/CustomCursor";
 import { ScanLineOverlay } from "@/components/ui/ScanLineOverlay";
+import { AIChatbot } from "@/components/ui/AIChatbot";
 import { AuthProvider } from "@/contexts/AuthContext";
 
 const Home = lazy(() => import("./pages/Home"));
 const About = lazy(() => import("./pages/About"));
 const Contact = lazy(() => import("./pages/Contact"));
+const Community = lazy(() => import("./pages/Community"));
+const Subscription = lazy(() => import("./pages/Subscription"));
 const Auth = lazy(() => import("./pages/Auth"));
 const Profile = lazy(() => import("./pages/Profile"));
 const SecureDelDashboard = lazy(() => import("./pages/SecureDel/index"));
@@ -45,6 +48,8 @@ const App = () => (
               <Route path="/" element={<Home />} />
               <Route path="/about" element={<About />} />
               <Route path="/try-now" element={React.createElement(lazy(() => import("./pages/TryNow")))} />
+              <Route path="/community" element={<Community />} />
+              <Route path="/subscription" element={<Subscription />} />
               <Route path="/contact" element={<Contact />} />
               <Route path="/auth" element={<Auth />} />
               <Route path="/profile" element={<Profile />} />
@@ -61,6 +66,7 @@ const App = () => (
             </Routes>
           </Suspense>
           <Footer />
+          <AIChatbot />
           <Toaster
             position="bottom-right"
             toastOptions={{
