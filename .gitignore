@@ -21,5 +21,11 @@ dist-ssr
 *.ntvs*
 *.njsproj
 *.sln
-*.sw?
 .env
+
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.db
+backend/storage/uploads/

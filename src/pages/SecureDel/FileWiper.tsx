@@ -1,350 +1,483 @@
-import { useState, useCallback } from "react";
+import { useState, useCallback, useEffect } from "react";
 import { motion } from "framer-motion";
-import { Upload, Shield, X, CheckCircle2, Download } from "lucide-react";
+import {
+  Upload,
+  Shield,
+  X,
+  CheckCircle2,
+  XCircle,
+  AlertTriangle,
+  MapPin,
+  TestTube,
+  FileText,
+  RotateCcw,
+  Loader2,
+  Info,
+} from "lucide-react";
 import { CyberButton } from "@/components/ui/CyberButton";
 import { TerminalWindow } from "@/components/ui/TerminalWindow";
-import { API_BASE, apiPost, logClientRun, subscribeRunEvents, ToolProgressEvent } from "@/lib/api";
+import { InputMethodSelector } from "@/components/ui/InputMethodSelector";
+import { FilePathSelector } from "@/components/ui/FilePathSelector";
+import {
+  validateFilePath,
+  generateDemoFile,
+  uploadSecureFile,
+  deleteFilePath,
+  wipeFiles,
+  formatBytes,
+  ValidatePathResult,
+  GenerateDemoResult,
+  UploadFileResult,
+  FileResult,
+  subscribeRunEvents,
+  ToolProgressEvent,
+} from "@/lib/api";
+
+// ─── Types ────────────────────────────────────────────────────────────────────
+
+type InputMode = "select" | "upload" | "filepath" | "demo";
+
+// ─── Algorithms ───────────────────────────────────────────────────────────────
 
 const algorithms = [
-  { id: "dod", name: "DOD 5220.22-M", passes: 7, desc: "US DoD standard multi-pass overwrite" },
-  { id: "gutmann", name: "Gutmann Method", passes: 35, desc: "Maximum forensic protection" },
-  { id: "prng", name: "PRNG Stream", passes: 3, desc: "Cryptographic random overwrite" },
-  { id: "zero", name: "Zero Fill", passes: 1, desc: "Single-pass zeroing" },
-  { id: "random", name: "Random Fill", passes: 1, desc: "Single-pass random data" },
-  { id: "custom", name: "Custom N-Pass", passes: 0, desc: "User-defined pass count" },
+  { id: "dod",     name: "DOD 5220.22-M",  passes: 3,  desc: "US DoD standard 3-pass overwrite" },
+  { id: "dod_ext", name: "DOD 5220.22-M Extended", passes: 7, desc: "7-pass high assurance overwrite" },
+  { id: "gutmann", name: "Gutmann Method", passes: 35, desc: "Maximum 35-pass forensic protection" },
+  { id: "zero",    name: "Zero Fill",      passes: 1,  desc: "Single-pass zeroing" },
+  { id: "custom",  name: "Custom N-Pass",  passes: 0,  desc: "User-defined pass count" },
 ];
 
-async function sha256hex(buffer: ArrayBuffer): Promise<string> {
-  const hashBuffer = await crypto.subtle.digest("SHA-256", buffer);
-  return Array.from(new Uint8Array(hashBuffer))
-    .map((b) => b.toString(16).padStart(2, "0"))
-    .join("");
-}
+// ─── Confirmation Dialog ──────────────────────────────────────────────────────
 
-function getPassPattern(pass: number, algoId: string): { label: string; fill: (buf: Uint8Array) => void } {
-  if (algoId === "zero") return { label: "0x00 (zero fill)", fill: (b) => b.fill(0x00) };
-  if (algoId === "random" || algoId === "prng")
-    return { label: "RANDOM (CSPRNG)", fill: (b) => crypto.getRandomValues(b) };
+const ConfirmDeleteDialog: React.FC<{
+  targetName: string;
+  targetPath: string;
+  isRealPath: boolean;
+  onConfirm: () => void;
+  onCancel: () => void;
+}> = ({ targetName, targetPath, isRealPath, onConfirm, onCancel }) => (
+  <div className="fixed inset-0 z-50 flex items-center justify-center bg-void/80 backdrop-blur-sm p-4">
+    <div className="rounded-2xl border border-destructive/40 bg-surface p-6 sm:p-8 max-w-md w-full shadow-2xl space-y-6">
+      <div className="flex items-center gap-3 text-destructive">
+        <AlertTriangle className="w-6 h-6 shrink-0" />
+        <h3 className="font-display font-bold text-lg uppercase tracking-wide">
+          Confirm Real Secure Deletion
+        </h3>
+      </div>
+      <div className="space-y-3 font-mono text-xs text-text-secondary">
+        <p>You are about to permanently sanitize and delete:</p>
+        <div className="p-3 rounded-lg bg-void border border-border space-y-1">
+          <p className="text-text-primary font-bold">{targetName}</p>
+          <p className="text-text-ghost text-[11px] break-all">{targetPath}</p>
+        </div>
+        {isRealPath ? (
+          <p className="text-destructive font-bold">
+            ⚠️ CAUTION: This will delete the actual file on your local filesystem. This action cannot be undone.
+          </p>
+        ) : (
+          <p className="text-text-ghost">
+            SecureDel will delete the uploaded copy from controlled storage.
+          </p>
+        )}
+      </div>
+      <div className="flex gap-3">
+        <CyberButton variant="ghost" size="sm" className="flex-1" onClick={onCancel}>
+          Cancel
+        </CyberButton>
+        <CyberButton variant="danger" size="sm" className="flex-1" onClick={onConfirm}>
+          Confirm Secure Delete
+        </CyberButton>
+      </div>
+    </div>
+  </div>
+);
 
-  const gutmannPatterns: Array<{ label: string; fill: (b: Uint8Array) => void }> = [
-    { label: "0x55 (alternating)", fill: (b) => b.fill(0x55) },
-    { label: "0xAA (alternating)", fill: (b) => b.fill(0xaa) },
-    { label: "0x92 0x49 0x24", fill: (b) => { for (let i = 0; i < b.length; i++) b[i] = [0x92, 0x49, 0x24][i % 3]; } },
-    { label: "0x49 0x24 0x92", fill: (b) => { for (let i = 0; i < b.length; i++) b[i] = [0x49, 0x24, 0x92][i % 3]; } },
-    { label: "0x24 0x92 0x49", fill: (b) => { for (let i = 0; i < b.length; i++) b[i] = [0x24, 0x92, 0x49][i % 3]; } },
-    { label: "0x00 (zero)", fill: (b) => b.fill(0x00) },
-    { label: "0x11 pattern", fill: (b) => b.fill(0x11) },
-    { label: "0x22 pattern", fill: (b) => b.fill(0x22) },
-    { label: "0x33 pattern", fill: (b) => b.fill(0x33) },
-    { label: "0x44 pattern", fill: (b) => b.fill(0x44) },
-    { label: "0x55 pattern", fill: (b) => b.fill(0x55) },
-    { label: "0x66 pattern", fill: (b) => b.fill(0x66) },
-    { label: "0x77 pattern", fill: (b) => b.fill(0x77) },
-    { label: "0x88 pattern", fill: (b) => b.fill(0x88) },
-    { label: "0x99 pattern", fill: (b) => b.fill(0x99) },
-    { label: "0xAA pattern", fill: (b) => b.fill(0xaa) },
-    { label: "0xBB pattern", fill: (b) => b.fill(0xbb) },
-    { label: "0xCC pattern", fill: (b) => b.fill(0xcc) },
-    { label: "0xDD pattern", fill: (b) => b.fill(0xdd) },
-    { label: "0xEE pattern", fill: (b) => b.fill(0xee) },
-    { label: "0xFF pattern", fill: (b) => b.fill(0xff) },
-    { label: "RANDOM", fill: (b) => crypto.getRandomValues(b) },
-    { label: "RANDOM", fill: (b) => crypto.getRandomValues(b) },
-    { label: "RANDOM", fill: (b) => crypto.getRandomValues(b) },
-    { label: "RANDOM", fill: (b) => crypto.getRandomValues(b) },
-    { label: "0x92 0x49 0x24", fill: (b) => { for (let i = 0; i < b.length; i++) b[i] = [0x92, 0x49, 0x24][i % 3]; } },
-    { label: "0x49 0x24 0x92", fill: (b) => { for (let i = 0; i < b.length; i++) b[i] = [0x49, 0x24, 0x92][i % 3]; } },
-    { label: "0x24 0x92 0x49", fill: (b) => { for (let i = 0; i < b.length; i++) b[i] = [0x24, 0x92, 0x49][i % 3]; } },
-    { label: "0x6D 0xB6 0xDB", fill: (b) => { for (let i = 0; i < b.length; i++) b[i] = [0x6d, 0xb6, 0xdb][i % 3]; } },
-    { label: "0xB6 0xDB 0x6D", fill: (b) => { for (let i = 0; i < b.length; i++) b[i] = [0xb6, 0xdb, 0x6d][i % 3]; } },
-    { label: "0xDB 0x6D 0xB6", fill: (b) => { for (let i = 0; i < b.length; i++) b[i] = [0xdb, 0x6d, 0xb6][i % 3]; } },
-    { label: "0x00 (final zero)", fill: (b) => b.fill(0x00) },
-    { label: "0xFF (final)", fill: (b) => b.fill(0xff) },
-    { label: "RANDOM (final)", fill: (b) => crypto.getRandomValues(b) },
-  ];
-
-  if (algoId === "gutmann") return gutmannPatterns[(pass - 1) % gutmannPatterns.length];
-
-  const dodPatterns = [
-    { label: "0x00 (zero pass)", fill: (b: Uint8Array) => b.fill(0x00) },
-    { label: "0xFF (ones pass)", fill: (b: Uint8Array) => b.fill(0xff) },
-    { label: "RANDOM (CSPRNG)", fill: (b: Uint8Array) => crypto.getRandomValues(b) },
-    { label: "0x00 (zero pass)", fill: (b: Uint8Array) => b.fill(0x00) },
-    { label: "0xFF (ones pass)", fill: (b: Uint8Array) => b.fill(0xff) },
-    { label: "RANDOM (CSPRNG)", fill: (b: Uint8Array) => crypto.getRandomValues(b) },
-    { label: "RANDOM (final verify)", fill: (b: Uint8Array) => crypto.getRandomValues(b) },
-  ];
-  return dodPatterns[(pass - 1) % dodPatterns.length];
-}
-
-function formatSize(bytes: number): string {
-  if (bytes < 1024) return `${bytes} B`;
-  if (bytes < 1024 * 1024) return `${(bytes / 1024).toFixed(1)} KB`;
-  return `${(bytes / (1024 * 1024)).toFixed(2)} MB`;
-}
-
-interface WipedFile {
-  name: string;
-  size: number;
-  originalHash: string;
-  finalHash: string;
-  blob: Blob;
-  backendResult?: any; // stores response from FastAPI backend
-}
+// ─── Main Component ───────────────────────────────────────────────────────────
 
 const FileWiper = () => {
-  const [files, setFiles] = useState<File[]>([]);
+  const [inputMode, setInputMode] = useState<InputMode>("select");
+  const [confirmOpen, setConfirmOpen] = useState(false);
+
+  // Algorithm settings
   const [algo, setAlgo] = useState("dod");
   const [customPasses, setCustomPasses] = useState(3);
-  const [running, setRunning] = useState(false);
-  const [complete, setComplete] = useState(false);
-  const [logs, setLogs] = useState<string[]>([]);
-  const [progress, setProgress] = useState(0);
-  const [wipedFiles, setWipedFiles] = useState<WipedFile[]>([]);
-  const [backendEnabled, setBackendEnabled] = useState(false); // toggle backend wipe
-  const [filePath, setFilePath] = useState(""); // manual path for backend wipe
-
   const selectedAlgo = algorithms.find((a) => a.id === algo)!;
   const passes = algo === "custom" ? customPasses : selectedAlgo.passes;
-  const isLocalFastApi = /^http:\/\/(localhost|127\.0\.0\.1):8000$/i.test(API_BASE);
 
-  const handleDrop = useCallback((e: React.DragEvent) => {
-    e.preventDefault();
-    setFiles((prev) => [...prev, ...Array.from(e.dataTransfer.files)]);
-  }, []);
+  // 1. Upload Mode State
+  const [uploadFileObj, setUploadFileObj] = useState<File | null>(null);
+  const [uploadedInfo, setUploadedInfo] = useState<UploadFileResult | null>(null);
+  const [isUploading, setIsUploading] = useState(false);
+  const [uploadError, setUploadError] = useState<string | null>(null);
 
-  const removeFile = (i: number) => setFiles((prev) => prev.filter((_, idx) => idx !== i));
+  // 2. File Path Mode State
+  const [validatedPath, setValidatedPath] = useState<ValidatePathResult | null>(null);
 
-  // Map algo id to pass count for backend
-  const getBackendPasses = () => {
-    if (algo === "gutmann") return 35;
-    if (algo === "dod") return 7;
-    if (algo === "custom") return customPasses;
-    return passes;
-  };
+  // 3. Demo Mode State
+  const [demoData, setDemoData] = useState<GenerateDemoResult | null>(null);
+  const [isGeneratingDemo, setIsGeneratingDemo] = useState(false);
+  const [demoError, setDemoError] = useState<string | null>(null);
 
-  const startWipe = async () => {
-    setRunning(true);
-    setLogs([]);
-    setProgress(0);
-    setComplete(false);
-    setWipedFiles([]);
+  // Operation State
+  const [running, setRunning] = useState(false);
+  const [complete, setComplete] = useState(false);
+  const [progress, setProgress] = useState(0);
+  const [logs, setLogs] = useState<string[]>([]);
+  const [deletionResult, setDeletionResult] = useState<FileResult | null>(null);
+  const [opError, setOpError] = useState<string | null>(null);
 
-    const results: WipedFile[] = [];
-    const addLog = (msg: string) => setLogs((prev) => [...prev, msg]);
-    const ts = () => new Date().toISOString().slice(11, 23);
-
-    addLog(`> [${ts()}] Initializing secure wipe protocol...`);
-    addLog(`> [${ts()}] Algorithm: ${selectedAlgo.name} (${passes}-pass)`);
-    addLog(`> [${ts()}] Files queued: ${files.length}`);
-
-    // ── Backend path wipe (real OS-level deletion via FastAPI) ──
-    if (backendEnabled && filePath.trim() && isLocalFastApi) {
-      const requestId = crypto.randomUUID();
-      const onProgress = (progress: ToolProgressEvent) => {
-        if (progress.tool_id !== "file-wiper") return;
-        if (progress.request_id !== requestId) return;
-
-        const details = progress.details as Record<string, any>;
-        if (progress.stage === "run_start") {
-          addLog(`> [${ts()}] Backend run started: ${details.files_total ?? 0} file(s), ${details.passes ?? 0} pass(es)`);
-        } else if (progress.stage === "file_start") {
-          addLog(`> [${ts()}] Backend file start: ${details.path}`);
-        } else if (progress.stage === "pass_start") {
-          addLog(`> [${ts()}] Backend pass ${details.pass_index}/${details.passes_total} — pattern ${details.pattern}`);
-        } else if (progress.stage === "pass_complete") {
-          addLog(`> [${ts()}] Backend pass ${details.pass_index}/${details.passes_total} complete (${details.percent}%)`);
-        } else if (progress.stage === "file_complete") {
-          addLog(`> [${ts()}] Backend file complete: ${details.path}`);
-        } else if (progress.stage === "file_error") {
-          addLog(`> [${ts()}] ✗ Backend file error: ${details.error}`);
-        } else if (progress.stage === "run_complete") {
-          addLog(`> [${ts()}] Backend run complete: ${details.succeeded}/${details.files_total} succeeded`);
+  // Real-time progress subscription
+  useEffect(() => {
+    const unsubscribe = subscribeRunEvents({
+      onProgress: (evt: ToolProgressEvent) => {
+        if (evt.tool_id !== "file-wiper") return;
+        const ts = new Date().toISOString().slice(11, 19);
+        if (evt.stage === "pass_start") {
+          const pass = evt.details?.pass_index ?? "?";
+          const total = evt.details?.passes_total ?? passes;
+          const pat = evt.details?.pattern ?? "RANDOM";
+          setLogs((p) => [...p, `> [${ts}] Pass ${pass}/${total}: Pattern ${pat}`]);
+        } else if (evt.stage === "pass_complete") {
+          const pct = Number(evt.details?.percent ?? 0);
+          setProgress(pct);
+        } else if (evt.stage === "file_complete") {
+          setLogs((p) => [
+            ...p,
+            `> [${ts}] ✓ Multi-pass sanitization complete`,
+            `> [${ts}] ✓ Physical file removed from disk`,
+            `> [${ts}] ✓ Filesystem post-deletion verification: PASSED (file exists = false)`,
+          ]);
+        } else if (evt.stage === "file_error") {
+          setLogs((p) => [
+            ...p,
+            `> [${ts}] ✗ ERROR: ${evt.details?.error || "Deletion failed"}`,
+          ]);
         }
-      };
-
-      const unsubscribeProgress = subscribeRunEvents({ onProgress });
-
-      addLog(`> [${ts()}] Sending to backend for OS-level secure deletion...`);
-      addLog(`> [${ts()}] Target path: ${filePath.trim()}`);
-      try {
-        const backendResult = await apiPost("/api/delete/wipe", {
-          paths: [filePath.trim()],
-          passes: getBackendPasses(),
-          verify: true,
-          remove_metadata: true,
-          request_id: requestId,
-        });
-        addLog(`> [${ts()}] Backend response received`);
-        const r = backendResult?.results?.[0];
-        if (r?.success) {
-          addLog(`> [${ts()}] ✓ OS-level wipe succeeded`);
-          addLog(`> [${ts()}] Passes done: ${r.passes_done}`);
-          addLog(`> [${ts()}] Original size: ${r.original_size} bytes`);
-          if (r.sha256_before) addLog(`> [${ts()}] SHA-256 before: ${r.sha256_before.slice(0, 32)}...`);
-          if (r.sha256_after) addLog(`> [${ts()}] SHA-256 after:  ${r.sha256_after.slice(0, 32)}...`);
-        } else {
-          addLog(`> [${ts()}] ✗ Backend wipe failed: ${r?.error ?? "unknown error"}`);
-        }
-      } catch (err: any) {
-        addLog(`> [${ts()}] ✗ Backend unreachable: ${err?.message ?? err}`);
-        addLog(`> [${ts()}] Continuing with browser-side wipe only...`);
-      } finally {
-        unsubscribeProgress();
-      }
-    } else if (backendEnabled && filePath.trim() && !isLocalFastApi) {
-      addLog(`> [${ts()}] Skipping OS-level path wipe in hosted mode.`);
-      addLog(`> [${ts()}] API target is ${API_BASE}`);
-      addLog(`> [${ts()}] Hosted backend cannot access files on your local disk path.`);
-      addLog(`> [${ts()}] Continuing with browser-side wipe only...`);
-    }
-
-    // ── Browser-side wipe (works on uploaded File objects) ──
-    for (let fi = 0; fi < files.length; fi++) {
-      const file = files[fi];
-      addLog(`>`);
-      addLog(`> ── FILE ${fi + 1}/${files.length}: ${file.name} ──`);
-      addLog(`> [${ts()}] Size: ${formatSize(file.size)}`);
-      addLog(`> [${ts()}] Type: ${file.type || "application/octet-stream"}`);
-
-      const originalBuffer = await file.arrayBuffer();
-      const originalHash = await sha256hex(originalBuffer);
-      addLog(`> [${ts()}] SHA-256 (original): ${originalHash.slice(0, 32)}...`);
-
-      const workingBuffer = originalBuffer.slice(0);
-      const workingView = new Uint8Array(workingBuffer);
-
-      for (let p = 1; p <= passes; p++) {
-        const pattern = getPassPattern(p, algo);
-        addLog(`> [${ts()}] Pass ${p}/${passes}: ${pattern.label}`);
-
-        const chunkSize = Math.max(65536, Math.ceil(workingView.length / 20));
-        let processed = 0;
-        while (processed < workingView.length) {
-          const chunk = workingView.subarray(processed, Math.min(processed + chunkSize, workingView.length));
-          pattern.fill(chunk);
-          processed += chunk.length;
-          const fileProgress = (fi / files.length + (((p - 1) / passes + (processed / workingView.length) / passes) / files.length));
-          setProgress(fileProgress * 100);
-          await new Promise((r) => setTimeout(r, 8));
-        }
-
-        const passHash = await sha256hex(workingBuffer);
-        addLog(`> [${ts()}] Pass ${p} SHA-256: ${passHash.slice(0, 32)}... ✓`);
-      }
-
-      const finalHash = await sha256hex(workingBuffer);
-      addLog(`> [${ts()}] Final SHA-256: ${finalHash.slice(0, 32)}...`);
-      addLog(`> [${ts()}] Original: ${originalHash.slice(0, 16)}...`);
-      addLog(`> [${ts()}] Hashes differ: ${originalHash !== finalHash ? "YES — data overwritten ✓" : "NO — same content"}`);
-      addLog(`> [${ts()}] ✓ ${file.name} — OVERWRITE COMPLETE`);
-
-      const finalBlob = new Blob([workingBuffer], { type: "application/octet-stream" });
-      results.push({ name: file.name, size: file.size, originalHash, finalHash, blob: finalBlob });
-    }
-
-    setProgress(100);
-    addLog(`>`);
-    addLog(`> ══════════════════════════════`);
-    addLog(`> ✓ ALL ${files.length} FILE(S) OVERWRITTEN`);
-    addLog(`> Overwritten copies ready for download.`);
-    addLog(`> Replace your originals with these to complete the wipe.`);
-    logClientRun({
-      toolId: "file-wiper",
-      action: "browser_wipe_complete",
-      status: "success",
-      details: {
-        files: files.length,
-        passes,
-        algorithm: selectedAlgo.id,
-        backendEnabled,
       },
     });
-    setWipedFiles(results);
+    return () => unsubscribe();
+  }, [passes]);
+
+  // ── Source badge ─────────────────────────────────────────────────────────
+
+  const sourceBadge = () => {
+    if (inputMode === "demo") return "🧪 SecureDel Demo Generator";
+    if (inputMode === "filepath") return "📍 Local File Path";
+    return "📁 File Upload";
+  };
+
+  // ── Handlers for switching modes ─────────────────────────────────────────
+
+  const handleResetAll = () => {
+    setUploadFileObj(null);
+    setUploadedInfo(null);
+    setValidatedPath(null);
+    setDemoData(null);
+    setDeletionResult(null);
+    setLogs([]);
+    setProgress(0);
     setRunning(false);
-    setComplete(true);
+    setComplete(false);
+    setOpError(null);
+    setInputMode("select");
   };
 
-  const downloadFile = (wf: WipedFile) => {
-    const url = URL.createObjectURL(wf.blob);
-    const a = document.createElement("a");
-    a.href = url;
-    a.download = `wiped_${wf.name}`;
-    a.click();
-    URL.revokeObjectURL(url);
+  // Setup Demo Mode
+  const setupDemoMode = async () => {
+    setInputMode("demo");
+    setIsGeneratingDemo(true);
+    setDemoError(null);
+    setLogs([]);
+    try {
+      const res = await generateDemoFile();
+      setDemoData(res);
+    } catch (err: any) {
+      setDemoError(err.message || "Failed to generate demo file on filesystem.");
+    } finally {
+      setIsGeneratingDemo(false);
+    }
   };
 
-  if (complete) {
+  // Handle File Upload
+  const handleFileUpload = async (file: File) => {
+    setUploadFileObj(file);
+    setIsUploading(true);
+    setUploadError(null);
+    try {
+      const res = await uploadSecureFile(file);
+      setUploadedInfo(res);
+    } catch (err: any) {
+      setUploadError(err.message || "Failed to upload file to SecureDel controlled storage.");
+    } finally {
+      setIsUploading(false);
+    }
+  };
+
+  // Handle Drag/Drop for upload
+  const handleDrop = useCallback((e: React.DragEvent) => {
+    e.preventDefault();
+    const files = Array.from(e.dataTransfer.files);
+    if (files.length > 0) {
+      handleFileUpload(files[0]);
+    }
+  }, []);
+
+  // ── Perform Secure Delete (Real Backend Call) ─────────────────────────────
+
+  const executeSecureDelete = async () => {
+    setConfirmOpen(false);
+    setRunning(true);
+    setComplete(false);
+    setProgress(5);
+    setLogs([]);
+    setOpError(null);
+
+    const ts = () => new Date().toISOString().slice(11, 19);
+    const addLog = (m: string) => setLogs((p) => [...p, m]);
+
+    let targetPath = "";
+    let targetName = "";
+
+    if (inputMode === "upload" && uploadedInfo) {
+      targetPath = uploadedInfo.path;
+      targetName = uploadedInfo.name;
+    } else if (inputMode === "filepath" && validatedPath) {
+      targetPath = validatedPath.path || "";
+      targetName = validatedPath.name || "";
+    } else if (inputMode === "demo" && demoData) {
+      targetPath = demoData.path;
+      targetName = demoData.name;
+    }
+
+    if (!targetPath) {
+      setOpError("No target file path available for deletion.");
+      setRunning(false);
+      return;
+    }
+
+    addLog(`> [${ts()}] Initiating SecureDel Real Filesystem Wipe Protocol`);
+    addLog(`> [${ts()}] Mode: ${sourceBadge()}`);
+    addLog(`> [${ts()}] Target File: ${targetName}`);
+    addLog(`> [${ts()}] Physical Path: ${targetPath}`);
+    addLog(`> [${ts()}] Overwrite Algorithm: ${selectedAlgo.name} (${passes} passes)`);
+    addLog(`> [${ts()}] Sending request to SecureDel Python backend...`);
+
+    try {
+      const result = await deleteFilePath(targetPath, passes, true, true);
+      setDeletionResult(result);
+      setProgress(100);
+
+      if (result.success && result.deleted && result.verified) {
+        addLog(`> [${ts()}] Status: 200 OK`);
+        addLog(`> [${ts()}] Passes Completed: ${result.passes_done}/${passes}`);
+        addLog(`> [${ts()}] Execution Time: ${result.time_taken}s`);
+        addLog(`> [${ts()}] ✓ SECURE DELETION COMPLETED`);
+        addLog(`> [${ts()}] ✓ Filesystem verification: FILE DOES NOT EXIST`);
+        addLog(`> [${ts()}] ✓ Verification Status: PASSED`);
+        setComplete(true);
+      } else {
+        const errorMsg = result.error || "Filesystem verification failed. The file may still exist.";
+        addLog(`> [${ts()}] ✗ FAILED: ${errorMsg}`);
+        setOpError(errorMsg);
+        setComplete(true);
+      }
+    } catch (err: any) {
+      const errMsg = err.message || "Failed to execute secure deletion on backend.";
+      addLog(`> [${ts()}] ✗ Backend Error: ${errMsg}`);
+      setOpError(errMsg);
+      setComplete(true);
+    } finally {
+      setRunning(false);
+    }
+  };
+
+  // ── Render: Mode Selection Screen ────────────────────────────────────────
+
+  if (inputMode === "select") {
     return (
-      <div>
-        <motion.div
-          initial={{ opacity: 0, scale: 0.95 }}
-          animate={{ opacity: 1, scale: 1 }}
-          className="p-6 rounded-xl bg-primary/5 border border-primary/20 text-center mb-6"
-        >
-          <CheckCircle2 className="w-12 h-12 text-primary mx-auto mb-4" />
-          <h2 className="font-display font-bold text-xl text-text-primary uppercase mb-2">
-            Overwrite Complete
-          </h2>
-          <p className="text-sm text-text-secondary font-mono">
-            {files.length} file(s) overwritten • {passes} passes • {selectedAlgo.name}
-          </p>
-          <p className="text-xs text-text-ghost font-mono mt-1">
-            Download the wiped copies below and replace your originals to complete destruction.
-          </p>
-        </motion.div>
-
-        <div className="space-y-2 mb-6">
-          {wipedFiles.map((wf, i) => (
-            <div key={i} className="flex items-center justify-between p-3 rounded-lg bg-surface border border-primary/20">
-              <div>
-                <p className="font-mono text-sm text-text-primary">{wf.name}</p>
-                <p className="font-mono text-xs text-text-ghost">
-                  {formatSize(wf.size)} • SHA-256: {wf.finalHash.slice(0, 24)}...
-                </p>
-              </div>
-              <button
-                onClick={() => downloadFile(wf)}
-                className="flex items-center gap-2 px-3 py-1.5 rounded-lg bg-primary/10 border border-primary/30 text-primary font-mono text-xs hover:bg-primary/20 transition-colors"
-              >
-                <Download className="w-3.5 h-3.5" />
-                Download Wiped
-              </button>
-            </div>
-          ))}
-        </div>
-
-        <TerminalWindow title="wipe-log">
-          {logs.map((l, i) => (
-            <p key={i} className={l.includes("✓") ? "text-primary" : l.includes("OVERWRITTEN") ? "text-primary font-bold" : ""}>{l}</p>
-          ))}
-        </TerminalWindow>
-        <CyberButton className="mt-6" onClick={() => { setFiles([]); setComplete(false); setLogs([]); setWipedFiles([]); setFilePath(""); }}>
-          Wipe Another File
-        </CyberButton>
+      <div className="space-y-6">
+        <h2 className="font-display font-bold text-xl text-text-primary uppercase tracking-wider mb-6 flex items-center gap-2">
+          <Shield className="w-5 h-5 text-primary" />
+          Secure File Deletion
+        </h2>
+        <InputMethodSelector
+          title="Choose File Source"
+          subtitle="Select genuine File Upload (storage copy), File Path (direct local filesystem deletion), or Generate Demo."
+          onSelectManual={(file) => {
+            setInputMode("upload");
+            if (file) handleFileUpload(file);
+          }}
+          onSelectFilePath={() => setInputMode("filepath")}
+          onSelectDemo={setupDemoMode}
+          accept="*/*"
+          acceptLabel="Any file format (.pdf, .docx, .txt, .zip, .dat, etc.)"
+        />
       </div>
     );
   }
 
+  // ── Source Header (for all active modes) ──────────────────────────────────
+
+  const SourceHeader = () => (
+    <div className="flex flex-wrap items-center justify-between gap-3 mb-4">
+      <h2 className="font-display font-bold text-xl text-text-primary uppercase tracking-wider flex items-center gap-2">
+        <Shield className="w-5 h-5 text-primary" />
+        Secure File Deletion
+      </h2>
+      <div className="flex items-center gap-2 font-mono text-xs">
+        <span
+          className={`px-2.5 py-1 rounded-lg border font-bold uppercase ${
+            inputMode === "demo"
+              ? "border-amber-400/40 bg-amber-500/10 text-amber-400"
+              : inputMode === "filepath"
+              ? "border-blue-400/40 bg-blue-500/10 text-blue-400"
+              : "border-primary/40 bg-primary/10 text-primary"
+          }`}
+        >
+          {sourceBadge()}
+        </span>
+        <button
+          onClick={handleResetAll}
+          className="text-text-ghost hover:text-text-primary underline text-xs cursor-pointer"
+        >
+          Change Source
+        </button>
+      </div>
+    </div>
+  );
+
+  // ── Render: Complete / Results Screen ────────────────────────────────────
+
+  if (complete) {
+    const isSuccess = deletionResult?.success && deletionResult?.verified && !deletionResult?.exists_after;
+    const targetName =
+      (inputMode === "upload" && uploadedInfo?.name) ||
+      (inputMode === "filepath" && validatedPath?.name) ||
+      (inputMode === "demo" && demoData?.name) ||
+      "File";
+    const targetPath =
+      (inputMode === "upload" && uploadedInfo?.path) ||
+      (inputMode === "filepath" && validatedPath?.path) ||
+      (inputMode === "demo" && demoData?.path) ||
+      "";
+
+    return (
+      <div className="space-y-6">
+        <SourceHeader />
+
+        <div className={`p-6 rounded-xl border text-left space-y-6 ${
+          isSuccess
+            ? "bg-emerald-500/5 border-emerald-500/30"
+            : "bg-destructive/5 border-destructive/30"
+        }`}>
+          <div className="flex items-center gap-3">
+            {isSuccess ? (
+              <CheckCircle2 className="w-8 h-8 text-emerald-400 shrink-0" />
+            ) : (
+              <XCircle className="w-8 h-8 text-destructive shrink-0" />
+            )}
+            <div>
+              <h3 className="font-display font-bold text-xl uppercase tracking-wide text-text-primary">
+                {isSuccess ? "SECURE DELETION RESULT" : "DELETION VERIFICATION FAILED"}
+              </h3>
+              <p className="font-mono text-xs text-text-secondary mt-0.5">
+                {isSuccess
+                  ? "The file was physically sanitized and confirmed deleted on the filesystem."
+                  : opError || "The file still exists or the operation could not be completed."}
+              </p>
+            </div>
+          </div>
+
+          {/* Detailed Verification Card */}
+          <div className="p-4 rounded-xl bg-void border border-border font-mono text-xs space-y-2.5">
+            <div className="flex justify-between border-b border-border/40 pb-1.5">
+              <span className="text-text-ghost">File:</span>
+              <span className="font-bold text-text-primary">{targetName}</span>
+            </div>
+            <div className="flex justify-between border-b border-border/40 pb-1.5">
+              <span className="text-text-ghost">Path:</span>
+              <span className="text-text-secondary text-[11px] max-w-md truncate" title={targetPath}>
+                {targetPath}
+              </span>
+            </div>
+            <div className="flex justify-between border-b border-border/40 pb-1.5">
+              <span className="text-text-ghost">Deletion:</span>
+              <span className={isSuccess ? "text-emerald-400 font-bold" : "text-destructive font-bold"}>
+                {isSuccess ? "✓ Completed" : "✗ Incomplete"}
+              </span>
+            </div>
+            <div className="flex justify-between border-b border-border/40 pb-1.5">
+              <span className="text-text-ghost">File exists:</span>
+              <span className={isSuccess ? "text-emerald-400 font-bold" : "text-destructive font-bold"}>
+                {isSuccess ? "✗ No (Confirmed Gone)" : "✓ Yes (File Still Present)"}
+              </span>
+            </div>
+            <div className="flex justify-between border-b border-border/40 pb-1.5">
+              <span className="text-text-ghost">Verification:</span>
+              <span className={isSuccess ? "text-emerald-400 font-bold" : "text-destructive font-bold"}>
+                {isSuccess ? "✓ PASSED" : "✗ FAILED"}
+              </span>
+            </div>
+            <div className="flex justify-between">
+              <span className="text-text-ghost">Status:</span>
+              <span className={`font-bold px-2 py-0.5 rounded text-[11px] ${
+                isSuccess
+                  ? "bg-emerald-500/20 text-emerald-400"
+                  : "bg-destructive/20 text-destructive"
+              }`}>
+                {isSuccess ? "DELETED" : "FAILED"}
+              </span>
+            </div>
+          </div>
+
+          <div className="flex flex-wrap gap-3">
+            <CyberButton variant="primary" size="sm" onClick={handleResetAll}>
+              Delete Another File
+            </CyberButton>
+            {inputMode === "demo" && (
+              <CyberButton variant="secondary" size="sm" onClick={setupDemoMode}>
+                Generate Another Demo File
+              </CyberButton>
+            )}
+          </div>
+        </div>
+
+        <TerminalWindow title="secure-deletion-audit-log">
+          {logs.map((l, i) => (
+            <p key={i} className={l.includes("✓") ? "text-emerald-400" : l.includes("✗") ? "text-destructive" : ""}>
+              {l}
+            </p>
+          ))}
+        </TerminalWindow>
+      </div>
+    );
+  }
+
+  // ── Render: Running State ────────────────────────────────────────────────
+
   if (running) {
     return (
-      <div>
-        <div className="mb-4">
+      <div className="space-y-4">
+        <SourceHeader />
+        <div>
           <div className="flex justify-between font-mono text-xs text-text-secondary mb-1">
-            <span>WIPING IN PROGRESS</span>
+            <span>PERFORMING MULTI-PASS OVERWRITE & FILESYSTEM VERIFICATION</span>
             <span>{Math.round(progress)}%</span>
           </div>
           <div className="h-2 bg-surface-2 rounded-full overflow-hidden">
             <motion.div
               className="h-full bg-primary rounded-full"
               style={{ width: `${progress}%` }}
-              transition={{ duration: 0.3 }}
+              animate={{ width: `${progress}%` }}
+              transition={{ duration: 0.2 }}
             />
           </div>
         </div>
-        <TerminalWindow title="live-output">
+        <TerminalWindow title="live-execution-stream">
           {logs.map((l, i) => (
-            <p key={i} className={l.includes("✓") ? "text-primary" : l.includes("OVERWRITTEN") ? "text-primary font-bold" : ""}>{l}</p>
+            <p key={i} className={l.includes("✓") ? "text-emerald-400" : l.includes("✗") ? "text-destructive" : ""}>
+              {l}
+            </p>
           ))}
           <span className="animate-blink text-primary">▌</span>
         </TerminalWindow>
@@ -352,149 +485,261 @@ const FileWiper = () => {
     );
   }
 
+  // ── Render: Active Mode Input Panels ─────────────────────────────────────
+
+  const canInitiate =
+    (inputMode === "upload" && uploadedInfo !== null) ||
+    (inputMode === "filepath" && validatedPath !== null && validatedPath.success) ||
+    (inputMode === "demo" && demoData !== null && demoData.success);
+
+  const getTargetName = () => {
+    if (inputMode === "upload") return uploadedInfo?.name ?? "Uploaded File";
+    if (inputMode === "filepath") return validatedPath?.name ?? "Local File";
+    if (inputMode === "demo") return demoData?.name ?? "demo_secret.txt";
+    return "Target File";
+  };
+
+  const getTargetPath = () => {
+    if (inputMode === "upload") return uploadedInfo?.path ?? "";
+    if (inputMode === "filepath") return validatedPath?.path ?? "";
+    if (inputMode === "demo") return demoData?.path ?? "";
+    return "";
+  };
+
   return (
-    <div className="grid grid-cols-1 lg:grid-cols-2 gap-8">
-      <div>
-        <h2 className="font-display font-bold text-xl text-text-primary uppercase tracking-wider mb-6">
-          <Shield className="inline w-5 h-5 text-primary mr-2" />
-          Secure File Wiper
-        </h2>
+    <div className="space-y-6">
+      <SourceHeader />
 
-        <div
-          onDrop={handleDrop}
-          onDragOver={(e) => e.preventDefault()}
-          className="border-2 border-dashed border-primary/25 rounded-xl p-12 text-center hover:border-primary/50 transition-colors cursor-pointer"
-          onClick={() => {
-            const input = document.createElement("input");
-            input.type = "file";
-            input.multiple = true;
-            input.onchange = (e) => {
-              const target = e.target as HTMLInputElement;
-              if (target.files) setFiles((prev) => [...prev, ...Array.from(target.files!)]);
-            };
-            input.click();
-          }}
-          data-interactive
-        >
-          <Upload className="w-8 h-8 text-primary/50 mx-auto mb-3" />
-          <p className="font-mono text-sm text-text-secondary">DROP FILES HERE or CLICK TO BROWSE</p>
-          <p className="font-mono text-xs text-text-ghost mt-2">Real multi-pass overwrite using CSPRNG & fixed patterns</p>
-        </div>
+      <div className="grid grid-cols-1 lg:grid-cols-2 gap-8">
+        {/* ── Left Column: Mode Input ──────────────────────────────────────── */}
+        <div className="space-y-4">
 
-        {files.length > 0 && (
-          <div className="mt-4 space-y-2">
-            {files.map((f, i) => (
-              <div key={i} className="flex items-center justify-between p-3 bg-surface rounded-lg border border-border">
-                <div>
-                  <p className="text-sm text-text-primary font-mono">{f.name}</p>
-                  <p className="text-xs text-text-ghost">{formatSize(f.size)} • {f.type || "octet-stream"}</p>
+          {/* 📁 MODE 1: FILE UPLOAD */}
+          {inputMode === "upload" && (
+            <div className="space-y-4">
+              <div className="p-4 rounded-xl bg-primary/5 border border-primary/20 flex items-start gap-3">
+                <Info className="w-5 h-5 text-primary shrink-0 mt-0.5" />
+                <div className="text-xs font-mono space-y-1">
+                  <p className="font-bold text-text-primary uppercase tracking-wide">
+                    UPLOAD MODE
+                  </p>
+                  <p className="text-text-secondary leading-relaxed">
+                    SecureDel will receive the file and store a copy in its controlled storage. Clicking Secure Delete will physically delete the uploaded copy, not the original file on your computer.
+                  </p>
                 </div>
-                <button onClick={() => removeFile(i)} className="text-text-ghost hover:text-destructive" data-interactive>
-                  <X className="w-4 h-4" />
-                </button>
               </div>
-            ))}
-          </div>
-        )}
 
-        {/* ── Backend OS-level wipe section ── */}
-        <div className="mt-6 p-4 rounded-xl bg-surface border border-border">
-          <div className="flex items-center justify-between mb-3">
-            <span className="font-mono text-xs text-text-ghost uppercase tracking-widest">
-              // OS-Level Backend Wipe
-            </span>
-            <button
-              onClick={() => setBackendEnabled((v) => !v)}
-              className={`relative w-10 h-5 rounded-full transition-colors ${backendEnabled ? "bg-primary" : "bg-surface-2 border border-border"}`}
-              data-interactive
-            >
-              <span className={`absolute top-0.5 w-4 h-4 rounded-full bg-white transition-all ${backendEnabled ? "left-5" : "left-0.5"}`} />
-            </button>
-          </div>
-          {backendEnabled && (
-            <>
-              <p className="font-mono text-xs text-text-ghost mb-2">
-                Enter the full file path on your machine for real OS-level deletion via the backend.
-              </p>
-              <input
-                type="text"
-                value={filePath}
-                onChange={(e) => setFilePath(e.target.value)}
-                placeholder="e.g. C:\Users\dinesh\secret.txt or /home/user/secret.txt"
-                className="w-full h-10 px-3 bg-surface-2 border border-border rounded-lg font-mono text-xs text-text-primary focus:border-primary/40 outline-none placeholder:text-text-ghost"
-              />
-              {isLocalFastApi ? (
-                <p className="font-mono text-xs text-destructive mt-2">
-                  ⚠ FastAPI local mode detected ({API_BASE}). This permanently deletes the file from disk.
-                </p>
+              {!uploadedInfo ? (
+                <div
+                  onDrop={handleDrop}
+                  onDragOver={(e) => e.preventDefault()}
+                  className="border-2 border-dashed border-primary/30 hover:border-primary/60 bg-void/50 hover:bg-primary/5 rounded-xl p-8 text-center transition-all cursor-pointer group"
+                  onClick={() => {
+                    const input = document.createElement("input");
+                    input.type = "file";
+                    input.onchange = (e: any) => {
+                      if (e.target.files && e.target.files[0]) {
+                        handleFileUpload(e.target.files[0]);
+                      }
+                    };
+                    input.click();
+                  }}
+                >
+                  <Upload className="w-8 h-8 text-primary/60 group-hover:text-primary group-hover:scale-110 transition-all mx-auto mb-3" />
+                  <p className="font-mono text-sm text-text-primary font-bold tracking-wide">
+                    {isUploading ? "UPLOADING TO SECURE STORAGE..." : "DROP FILE HERE or CLICK TO UPLOAD"}
+                  </p>
+                  <p className="font-mono text-xs text-text-ghost mt-1">
+                    Select a copy of any file to test secure sanitization
+                  </p>
+                  {isUploading && (
+                    <div className="mt-4 flex items-center justify-center gap-2 text-primary font-mono text-xs">
+                      <Loader2 className="w-4 h-4 animate-spin" />
+                      <span>Saving to SecureDel storage...</span>
+                    </div>
+                  )}
+                </div>
               ) : (
-                <p className="font-mono text-xs text-amber-400 mt-2">
-                  ⚠ Hosted mode detected ({API_BASE}). Local disk path deletion is unavailable from hosted backend.
-                </p>
+                <div className="p-4 rounded-xl bg-void border border-primary/30 space-y-3 font-mono text-xs shadow-inner">
+                  <div className="flex items-center justify-between border-b border-border/40 pb-2">
+                    <span className="font-bold text-primary flex items-center gap-1.5">
+                      <CheckCircle2 className="w-4 h-4 text-primary" /> FILE UPLOADED TO STORAGE
+                    </span>
+                    <button
+                      onClick={() => { setUploadedInfo(null); setUploadFileObj(null); }}
+                      className="text-text-ghost hover:text-destructive text-xs"
+                      title="Remove and pick another"
+                    >
+                      <X className="w-4 h-4" />
+                    </button>
+                  </div>
+                  <div className="grid grid-cols-2 gap-x-4 gap-y-1.5">
+                    <span className="text-text-ghost">Filename:</span>
+                    <span className="text-text-primary font-bold truncate">{uploadedInfo.name}</span>
+                    <span className="text-text-ghost">Size:</span>
+                    <span className="text-primary">{formatBytes(uploadedInfo.size)}</span>
+                    <span className="text-text-ghost">Upload ID:</span>
+                    <span className="text-text-secondary truncate">{uploadedInfo.upload_id}</span>
+                    <span className="text-text-ghost">Status:</span>
+                    <span className="text-emerald-400 font-bold">READY FOR DELETION</span>
+                  </div>
+                </div>
               )}
-            </>
+
+              {uploadError && (
+                <div className="p-3 rounded-lg bg-destructive/10 border border-destructive/30 text-destructive text-xs font-mono flex items-center gap-2">
+                  <XCircle className="w-4 h-4 shrink-0" />
+                  <span>{uploadError}</span>
+                </div>
+              )}
+            </div>
+          )}
+
+          {/* 📍 MODE 2: FILE PATH */}
+          {inputMode === "filepath" && (
+            <div className="p-5 rounded-xl border border-blue-500/40 bg-surface space-y-4 shadow-xl">
+              <div className="flex items-center gap-2 text-blue-400 font-mono text-xs font-bold uppercase">
+                <MapPin className="w-4 h-4" /> Local Filesystem Path
+              </div>
+
+              <FilePathSelector
+                label="Enter the full path of an existing file:"
+                helper="SecureDel will check existence and execute the deletion directly on that physical path."
+                placeholder="C:\SecureDel\demo-files\demo_secret.txt"
+                defaultPath="C:\SecureDel\demo-files\demo_secret.txt"
+                toolId="file-wiper"
+                onPathValidated={(res) => setValidatedPath(res)}
+                onClear={() => setValidatedPath(null)}
+              />
+            </div>
+          )}
+
+          {/* 🧪 MODE 3: GENERATE DEMO */}
+          {inputMode === "demo" && (
+            <div className="p-5 rounded-xl border border-amber-500/40 bg-surface space-y-4 shadow-xl">
+              <div className="flex items-center justify-between">
+                <p className="font-mono text-xs text-amber-400 font-bold uppercase flex items-center gap-2">
+                  <TestTube className="w-4 h-4" /> 🧪 Physical Demo File Queued
+                </p>
+                <span className="px-2 py-0.5 rounded bg-amber-400/20 text-amber-400 font-mono text-[10px] font-bold">
+                  REAL FILE
+                </span>
+              </div>
+
+              {isGeneratingDemo ? (
+                <div className="p-6 text-center space-y-2 font-mono text-xs text-amber-400">
+                  <Loader2 className="w-6 h-6 animate-spin mx-auto text-amber-400" />
+                  <p>Writing demo_secret.txt to physical disk...</p>
+                </div>
+              ) : demoData ? (
+                <div className="p-3 rounded-lg bg-void border border-border font-mono text-xs space-y-2">
+                  <div className="flex justify-between">
+                    <span className="text-text-ghost">Filename:</span>
+                    <span className="font-bold text-text-primary">{demoData.name}</span>
+                  </div>
+                  <div className="flex justify-between">
+                    <span className="text-text-ghost">Size:</span>
+                    <span className="text-primary">{demoData.size} bytes</span>
+                  </div>
+                  <div className="flex justify-between">
+                    <span className="text-text-ghost">Path:</span>
+                    <span className="text-amber-400 text-[11px] truncate max-w-[200px]" title={demoData.path}>
+                      {demoData.path}
+                    </span>
+                  </div>
+                  <div className="flex justify-between">
+                    <span className="text-text-ghost">Status:</span>
+                    <span className="text-emerald-400 font-bold">{demoData.status}</span>
+                  </div>
+                </div>
+              ) : (
+                demoError && (
+                  <div className="p-3 rounded-lg bg-destructive/10 border border-destructive/30 text-destructive text-xs font-mono">
+                    {demoError}
+                  </div>
+                )
+              )}
+
+              <CyberButton
+                variant="ghost"
+                size="sm"
+                className="w-full text-amber-400 hover:bg-amber-500/10 text-xs font-mono"
+                onClick={setupDemoMode}
+              >
+                <RotateCcw className="w-3.5 h-3.5 mr-1" /> Re-generate Demo File
+              </CyberButton>
+            </div>
           )}
         </div>
-      </div>
 
-      <div>
-        <span className="font-mono text-xs text-text-ghost tracking-widest uppercase block mb-4">
-          // Wipe Algorithm
-        </span>
-        <div className="grid grid-cols-1 sm:grid-cols-2 gap-2 mb-6">
-          {algorithms.map((a) => (
-            <button
-              key={a.id}
-              onClick={() => setAlgo(a.id)}
-              className={`p-3 rounded-lg border text-left transition-all ${algo === a.id
-                  ? "border-primary/40 bg-primary/5"
-                  : "border-border bg-surface hover:border-border/60"
+        {/* ── Right Column: Algorithm Selection & Actions ───────────────────── */}
+        <div className="space-y-4">
+          <span className="font-mono text-xs text-text-ghost tracking-widest uppercase block">
+            // Sanitization Algorithm
+          </span>
+          <div className="grid grid-cols-1 sm:grid-cols-2 gap-2">
+            {algorithms.map((a) => (
+              <button
+                key={a.id}
+                onClick={() => setAlgo(a.id)}
+                className={`p-3 rounded-lg border text-left transition-all ${
+                  algo === a.id
+                    ? "border-primary/40 bg-primary/5"
+                    : "border-border bg-surface hover:border-border/60"
                 }`}
-              data-interactive
-            >
-              <div className="flex items-center justify-between">
-                <span className="font-mono text-sm text-text-primary">{a.name}</span>
-                {a.passes > 0 && (
-                  <span className="text-[10px] font-mono text-primary bg-primary/10 px-1.5 py-0.5 rounded">
-                    {a.passes}x
-                  </span>
-                )}
-              </div>
-              <p className="text-xs text-text-ghost mt-1">{a.desc}</p>
-            </button>
-          ))}
-        </div>
-
-        {algo === "custom" && (
-          <div className="mb-6">
-            <label className="font-mono text-xs text-text-ghost uppercase tracking-widest block mb-2">Custom Passes</label>
-            <input
-              type="number"
-              min={1}
-              max={99}
-              value={customPasses}
-              onChange={(e) => setCustomPasses(Number(e.target.value))}
-              className="w-24 h-10 px-3 bg-surface border border-border rounded-lg font-mono text-sm text-text-primary focus:border-primary/40 outline-none"
-            />
+              >
+                <div className="flex items-center justify-between">
+                  <span className="font-mono text-sm text-text-primary">{a.name}</span>
+                  {a.passes > 0 && (
+                    <span className="text-[10px] font-mono text-primary bg-primary/10 px-1.5 py-0.5 rounded">
+                      {a.passes}x
+                    </span>
+                  )}
+                </div>
+                <p className="text-xs text-text-ghost mt-1">{a.desc}</p>
+              </button>
+            ))}
           </div>
-        )}
 
-        <div className="p-4 rounded-xl bg-destructive/5 border border-destructive/20 mb-6">
-          <p className="font-mono text-xs text-destructive uppercase tracking-widest">
-            ⚠ Overwrites file bytes with real patterns. Download the wiped copy to replace your original.
-          </p>
+          {algo === "custom" && (
+            <div className="flex items-center gap-3">
+              <span className="font-mono text-xs text-text-ghost">Passes:</span>
+              <input
+                type="number"
+                min={1}
+                max={35}
+                value={customPasses}
+                onChange={(e) => setCustomPasses(Math.max(1, Math.min(35, +e.target.value)))}
+                className="w-20 h-9 px-3 bg-surface-2 border border-border rounded-lg font-mono text-sm text-text-primary focus:border-primary/40 outline-none"
+              />
+            </div>
+          )}
+
+          <div className="pt-2">
+            <CyberButton
+              variant="danger"
+              size="lg"
+              className="w-full"
+              disabled={!canInitiate || running}
+              onClick={() => setConfirmOpen(true)}
+            >
+              <Shield className="w-4 h-4 mr-2" />
+              Secure Delete
+            </CyberButton>
+          </div>
         </div>
-
-        <CyberButton
-          variant="danger"
-          size="lg"
-          className="w-full"
-          disabled={files.length === 0 && !(backendEnabled && filePath.trim())}
-          onClick={startWipe}
-        >
-          Initiate Secure Wipe
-        </CyberButton>
       </div>
+
+      {/* Confirmation Dialog */}
+      {confirmOpen && (
+        <ConfirmDeleteDialog
+          targetName={getTargetName()}
+          targetPath={getTargetPath()}
+          isRealPath={inputMode === "filepath" || inputMode === "demo"}
+          onConfirm={executeSecureDelete}
+          onCancel={() => setConfirmOpen(false)}
+        />
+      )}
     </div>
   );
 };

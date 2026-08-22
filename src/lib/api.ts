@@ -50,13 +50,20 @@ export interface RunsPage {
     offset: number;
 }
 
+export function formatBytes(bytes: number): string {
+    if (bytes < 1024) return `${bytes} B`;
+    if (bytes < 1024 * 1024) return `${(bytes / 1024).toFixed(1)} KB`;
+    if (bytes < 1024 * 1024 * 1024) return `${(bytes / (1024 * 1024)).toFixed(2)} MB`;
+    return `${(bytes / (1024 * 1024 * 1024)).toFixed(2)} GB`;
+}
+
 async function parseResponse(res: Response) {
     const contentType = res.headers.get("content-type") ?? "";
     const isJson = contentType.includes("application/json");
     const data = isJson ? await res.json() : await res.text();
 
     if (!res.ok) {
-        const message = typeof data === "string" ? data : data?.detail || `HTTP ${res.status}`;
+        const message = typeof data === "string" ? data : data?.detail || data?.message || `HTTP ${res.status}`;
         throw new Error(message);
     }
     return data;
@@ -76,6 +83,19 @@ export async function apiPost(endpoint: string, body: object) {
     return parseResponse(res);
 }
 
+export async function apiUpload(endpoint: string, formData: FormData) {
+    const { data } = await supabase.auth.getSession();
+    const token = data.session?.access_token;
+    const res = await fetch(`${API_BASE}${endpoint}`, {
+        method: "POST",
+        headers: {
+            ...(token ? { Authorization: `Bearer ${token}` } : {}),
+        },
+        body: formData,
+    });
+    return parseResponse(res);
+}
+
 export async function apiGet(endpoint: string) {
     const { data } = await supabase.auth.getSession();
     const token = data.session?.access_token;
@@ -83,6 +103,220 @@ export async function apiGet(endpoint: string) {
         headers: token ? { Authorization: `Bearer ${token}` } : {},
     });
     return parseResponse(res);
+}
+
+export interface ValidatePathResult {
+    success: boolean;
+    exists: boolean;
+    isFile: boolean;
+    name?: string;
+    size?: number;
+    type?: string;
+    mime?: string;
+    path?: string;
+    status?: string;
+    error?: string;
+    message?: string;
+}
+
+export interface GenerateDemoResult {
+    success: boolean;
+    path: string;
+    name: string;
+    size: number;
+    type: string;
+    content: string;
+    status: string;
+    message?: string;
+}
+
+export interface UploadFileResult {
+    success: boolean;
+    upload_id: string;
+    name: string;
+    size: number;
+    path: string;
+    status: string;
+}
+
+export interface FileResult {
+    path: string;
+    name?: string;
+    success: boolean;
+    deleted: boolean;
+    verified: boolean;
+    exists_after: boolean;
+    passes_done: number;
+    original_size: number;
+    sha256_before?: string | null;
+    sha256_after?: string | null;
+    error?: string | null;
+    time_taken: number;
+}
+
+export interface DeleteResponse {
+    total: number;
+    succeeded: number;
+    failed: number;
+    results: FileResult[];
+}
+
+export async function validateFilePath(path: string): Promise<ValidatePathResult> {
+    try {
+        return await apiPost("/api/delete/validate-path", { path });
+    } catch (err: any) {
+        return {
+            success: false,
+            exists: false,
+            isFile: false,
+            path,
+            error: "REQUEST_FAILED",
+            message: err.message || "Could not validate path with backend.",
+        };
+    }
+}
+
+export async function generateDemoFile(): Promise<GenerateDemoResult> {
+    return await apiPost("/api/delete/generate-demo", {});
+}
+
+export async function uploadSecureFile(file: File): Promise<UploadFileResult> {
+    const formData = new FormData();
+    formData.append("file", file);
+    return await apiUpload("/api/delete/upload", formData);
+}
+
+export async function deleteFilePath(
+    path: string,
+    passes: number = 3,
+    verify: boolean = true,
+    removeMetadata: boolean = true,
+    requestId?: string
+): Promise<FileResult> {
+    return await apiPost("/api/delete/path", {
+        path,
+        passes,
+        verify,
+        remove_metadata: removeMetadata,
+        request_id: requestId,
+    });
+}
+
+export async function wipeFiles(
+    paths: string[],
+    passes: number = 3,
+    verify: boolean = true,
+    removeMetadata: boolean = true,
+    requestId?: string
+): Promise<DeleteResponse> {
+    return await apiPost("/api/delete/wipe", {
+        paths,
+        passes,
+        verify,
+        remove_metadata: removeMetadata,
+        request_id: requestId,
+    });
+}
+
+// ── Tool 2: Browser Cache APIs ───────────────────────────────────
+export async function validateCachePath(path: string) {
+    return await apiPost("/api/browser/validate-path", { path });
+}
+export async function generateDemoCache() {
+    return await apiPost("/api/browser/generate-demo", {});
+}
+export async function uploadCacheFile(file: File) {
+    const formData = new FormData();
+    formData.append("file", file);
+    return await apiUpload("/api/browser/upload", formData);
+}
+export async function wipeCachePath(path: string, passes = 3) {
+    return await apiPost("/api/browser/wipe-path", { path, passes });
+}
+export async function detectBrowsers() {
+    return await apiGet("/api/browser/detect");
+}
+export async function wipeBrowsers(params: { browsers: string[]; wipe_cache?: boolean; wipe_cookies?: boolean; wipe_sessions?: boolean; passes?: number }) {
+    return await apiPost("/api/browser/wipe", params);
+}
+
+// ── Tool 3: Recent Files APIs ────────────────────────────────────
+export async function validateRecentPath(path: string) {
+    return await apiPost("/api/recent/validate-path", { path });
+}
+export async function generateDemoRecent() {
+    return await apiPost("/api/recent/generate-demo", {});
+}
+export async function uploadRecentFile(file: File) {
+    const formData = new FormData();
+    formData.append("file", file);
+    return await apiUpload("/api/recent/upload", formData);
+}
+export async function cleanRecentPath(path: string, passes = 3) {
+    return await apiPost("/api/recent/clean-path", { path, passes });
+}
+export async function detectRecent() {
+    return await apiGet("/api/recent/detect");
+}
+export async function wipeRecent(params: { wipe_recent_files?: boolean; wipe_jump_lists?: boolean; wipe_thumbnails?: boolean; wipe_prefetch?: boolean; clear_registry?: boolean; passes?: number }) {
+    return await apiPost("/api/recent/wipe", params);
+}
+
+// ── Tool 4: Log Scanner APIs ─────────────────────────────────────
+export async function validateLogPath(path: string) {
+    return await apiPost("/api/logs/validate-path", { path });
+}
+export async function generateDemoLogs() {
+    return await apiPost("/api/logs/generate-demo", {});
+}
+export async function uploadLogFile(file: File) {
+    const formData = new FormData();
+    formData.append("file", file);
+    return await apiUpload("/api/logs/upload", formData);
+}
+export async function scanLogs(params: { paths: string[]; recursive?: boolean; patterns?: string[]; extensions?: string[] }) {
+    return await apiPost("/api/logs/scan", params);
+}
+export async function redactLogs(params: { paths: string[]; action: "redact" | "delete"; passes?: number }) {
+    return await apiPost("/api/logs/redact", params);
+}
+
+// ── Tool 5: Secret Scanner APIs ──────────────────────────────────
+export async function validateRepoPath(path: string) {
+    return await apiPost("/api/secrets/validate-path", { path });
+}
+export async function generateDemoRepo() {
+    return await apiPost("/api/secrets/generate-demo", {});
+}
+export async function uploadRepoFile(file: File) {
+    const formData = new FormData();
+    formData.append("file", file);
+    return await apiUpload("/api/secrets/upload", formData);
+}
+export async function scanRepoSecrets(params: { root: string; patterns?: string[]; max_file_size_kb?: number }) {
+    return await apiPost("/api/secrets/scan", params);
+}
+export async function remediateSecrets(params: { root: string; patterns?: string[]; action?: string; passes?: number }) {
+    return await apiPost("/api/secrets/remediate", params);
+}
+
+// ── Tool 6: Temp Cleaner APIs ────────────────────────────────────
+export async function validateTempPath(path: string) {
+    return await apiPost("/api/temp/validate-path", { path });
+}
+export async function generateDemoTemp() {
+    return await apiPost("/api/temp/generate-demo", {});
+}
+export async function uploadTempFile(file: File) {
+    const formData = new FormData();
+    formData.append("file", file);
+    return await apiUpload("/api/temp/upload", formData);
+}
+export async function scanTempFiles(params: { directories?: string[]; older_than_minutes?: number; sensitive_only?: boolean; max_size_mb?: number }) {
+    return await apiPost("/api/temp/scan", params);
+}
+export async function wipeTempFiles(params: { directories?: string[]; older_than_minutes?: number; sensitive_only?: boolean; passes?: number }) {
+    return await apiPost("/api/temp/wipe", params);
 }
 
 export async function fetchRecentRuns(query: RunsQuery = {}): Promise<RunsPage> {

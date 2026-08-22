@@ -336,7 +336,8 @@ app.add_middleware(
 
 auth_dep = [Depends(get_current_user)]
 
-app.include_router(delete_router, prefix="/api/delete",  tags=["Secure Delete"], dependencies=auth_dep)
+app.include_router(delete_router, prefix="/api/delete",     tags=["Secure Delete"], dependencies=auth_dep)
+app.include_router(delete_router, prefix="/api/filesystem", tags=["Filesystem"],    dependencies=auth_dep)
 app.include_router(browser_router, prefix="/api/browser", tags=["Browser Cache"], dependencies=auth_dep)
 app.include_router(recent_router, prefix="/api/recent",  tags=["Recent Files"], dependencies=auth_dep)
 app.include_router(log_router,    prefix="/api/logs",    tags=["Log Scanner"], dependencies=auth_dep)
@@ -350,12 +351,6 @@ async def track_api_runs(request: Request, call_next):
     should_track = _should_track(path)
     started_at = _utc_now_iso()
     started_ts = time.perf_counter()
-    request_payload = None
-
-    if should_track:
-        body = await request.body()
-        if "application/json" in request.headers.get("content-type", ""):
-            request_payload = _safe_json(body)
 
     try:
         response = await call_next(request)
@@ -369,7 +364,7 @@ async def track_api_runs(request: Request, call_next):
                 started_at=started_at,
                 finished_at=_utc_now_iso(),
                 duration_ms=int((time.perf_counter() - started_ts) * 1000),
-                request_payload=request_payload,
+                request_payload=None,
                 error_message=str(exc),
             )
         raise
@@ -383,7 +378,7 @@ async def track_api_runs(request: Request, call_next):
             started_at=started_at,
             finished_at=_utc_now_iso(),
             duration_ms=int((time.perf_counter() - started_ts) * 1000),
-            request_payload=request_payload,
+            request_payload=None,
             response_payload={"status_code": response.status_code},
             error_message=None if response.status_code < 400 else f"HTTP {response.status_code}",
         )

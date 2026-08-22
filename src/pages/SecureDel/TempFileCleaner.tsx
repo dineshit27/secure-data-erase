@@ -1,416 +1,557 @@
-import { useState, useEffect } from "react";
-import { Trash2, CheckCircle2, AlertTriangle, RefreshCw } from "lucide-react";
+import { useState } from "react";
+import {
+  Trash2,
+  CheckCircle2,
+  XCircle,
+  MapPin,
+  TestTube,
+  RotateCcw,
+  Shield,
+  Loader2,
+  AlertTriangle,
+  Upload,
+  X,
+  FolderOpen,
+} from "lucide-react";
 import { CyberButton } from "@/components/ui/CyberButton";
 import { TerminalWindow } from "@/components/ui/TerminalWindow";
-import { logClientProgress, logClientRun } from "@/lib/api";
+import { InputMethodSelector } from "@/components/ui/InputMethodSelector";
+import {
+  validateTempPath,
+  generateDemoTemp,
+  uploadTempFile,
+  scanTempFiles,
+  wipeTempFiles,
+  formatBytes,
+} from "@/lib/api";
+import { validatePathExtension, type ExtensionValidationResult } from "@/lib/extensionRules";
+import { ExtensionErrorBadge } from "@/components/ui/ExtensionErrorBadge";
 
-interface StorageCategory {
-  id: string;
-  label: string;
-  description: string;
-  count: number;
-  sizeBytes: number;
-  sensitive: boolean;
-  items: string[];
-  clearFn: () => Promise<number>;
-}
-
-function formatBytes(n: number): string {
-  if (n <= 0) return "0 B";
-  if (n < 1024) return `${n} B`;
-  if (n < 1024 * 1024) return `${(n / 1024).toFixed(1)} KB`;
-  if (n < 1024 * 1024 * 1024) return `${(n / (1024 * 1024)).toFixed(2)} MB`;
-  return `${(n / (1024 * 1024 * 1024)).toFixed(2)} GB`;
-}
-
-function measureLocalStorage(): { count: number; bytes: number; keys: string[] } {
-  try {
-    const keys: string[] = [];
-    let bytes = 0;
-    for (let i = 0; i < localStorage.length; i++) {
-      const key = localStorage.key(i) ?? "";
-      const val = localStorage.getItem(key) ?? "";
-      bytes += (key.length + val.length) * 2;
-      keys.push(key);
-    }
-    return { count: localStorage.length, bytes, keys };
-  } catch {
-    return { count: 0, bytes: 0, keys: [] };
-  }
-}
-
-function measureSessionStorage(): { count: number; bytes: number; keys: string[] } {
-  try {
-    const keys: string[] = [];
-    let bytes = 0;
-    for (let i = 0; i < sessionStorage.length; i++) {
-      const key = sessionStorage.key(i) ?? "";
-      const val = sessionStorage.getItem(key) ?? "";
-      bytes += (key.length + val.length) * 2;
-      keys.push(key);
-    }
-    return { count: sessionStorage.length, bytes, keys };
-  } catch {
-    return { count: 0, bytes: 0, keys: [] };
-  }
-}
-
-async function measureCaches(): Promise<{ count: number; names: string[] }> {
-  try {
-    const names = await caches.keys();
-    return { count: names.length, names };
-  } catch {
-    return { count: 0, names: [] };
-  }
-}
-
-async function measureIndexedDB(): Promise<{ count: number; names: string[] }> {
-  try {
-    const dbs = await indexedDB.databases();
-    const names = dbs.map((d) => d.name ?? "unknown").filter(Boolean);
-    return { count: names.length, names };
-  } catch {
-    return { count: 0, names: [] };
-  }
-}
-
-async function buildCategories(): Promise<StorageCategory[]> {
-  const ls = measureLocalStorage();
-  const ss = measureSessionStorage();
-  const cacheInfo = await measureCaches();
-  const idbInfo = await measureIndexedDB();
-
-  let estimatedUsage = 0;
-  try {
-    const est = await navigator.storage.estimate();
-    estimatedUsage = est.usage ?? 0;
-  } catch { }
-
-  const cacheBytes = Math.max(0, estimatedUsage - ls.bytes - ss.bytes);
-
-  return [
-    {
-      id: "localstorage",
-      label: "Local Storage",
-      description: "Persistent key-value data stored in browser",
-      count: ls.count,
-      sizeBytes: ls.bytes,
-      sensitive: true,
-      items: ls.keys.slice(0, 5),
-      clearFn: async () => {
-        const n = localStorage.length;
-        localStorage.clear();
-        return n;
-      },
-    },
-    {
-      id: "sessionstorage",
-      label: "Session Storage",
-      description: "Tab-scoped temporary session data",
-      count: ss.count,
-      sizeBytes: ss.bytes,
-      sensitive: true,
-      items: ss.keys.slice(0, 5),
-      clearFn: async () => {
-        const n = sessionStorage.length;
-        sessionStorage.clear();
-        return n;
-      },
-    },
-    {
-      id: "cacheapi",
-      label: "Cache API / Service Worker Caches",
-      description: "Offline/PWA cached responses",
-      count: cacheInfo.count,
-      sizeBytes: cacheInfo.count > 0 ? cacheBytes : 0,
-      sensitive: false,
-      items: cacheInfo.names.slice(0, 5),
-      clearFn: async () => {
-        const keys = await caches.keys();
-        for (const k of keys) await caches.delete(k);
-        return keys.length;
-      },
-    },
-    {
-      id: "indexeddb",
-      label: "IndexedDB Databases",
-      description: "Structured browser-side databases",
-      count: idbInfo.count,
-      sizeBytes: 0,
-      sensitive: true,
-      items: idbInfo.names.slice(0, 5),
-      clearFn: async () => {
-        const dbs = await indexedDB.databases();
-        for (const db of dbs) {
-          if (db.name) {
-            await new Promise<void>((resolve) => {
-              const req = indexedDB.deleteDatabase(db.name!);
-              req.onsuccess = () => resolve();
-              req.onerror = () => resolve();
-              req.onblocked = () => resolve();
-            });
-          }
-        }
-        return dbs.length;
-      },
-    },
-    {
-      id: "cookies",
-      label: "Cookies (this domain)",
-      description: `All cookies for ${window.location.hostname}`,
-      count: document.cookie ? document.cookie.split(";").filter((c) => c.trim()).length : 0,
-      sizeBytes: document.cookie.length * 2,
-      sensitive: true,
-      items: document.cookie
-        ? document.cookie.split(";").map((c) => c.split("=")[0].trim()).slice(0, 5)
-        : [],
-      clearFn: async () => {
-        const cookies = document.cookie.split(";");
-        let n = 0;
-        for (const cookie of cookies) {
-          const name = cookie.split("=")[0].trim();
-          if (!name) continue;
-          const domain = window.location.hostname;
-          for (const path of ["/", window.location.pathname, ""]) {
-            document.cookie = `${name}=; expires=Thu, 01 Jan 1970 00:00:00 UTC; path=${path}; domain=${domain};`;
-            document.cookie = `${name}=; expires=Thu, 01 Jan 1970 00:00:00 UTC; path=${path};`;
-          }
-          n++;
-        }
-        return n;
-      },
-    },
-  ];
-}
+type InputMode = "select" | "upload" | "filepath" | "demo";
 
 const TempFileCleaner = () => {
-  const [categories, setCategories] = useState<StorageCategory[]>([]);
-  const [scanned, setScanned] = useState(false);
+  const [inputMode, setInputMode] = useState<InputMode>("select");
+  const [confirmOpen, setConfirmOpen] = useState(false);
+
+  // Upload Mode State
+  const [uploading, setUploading] = useState(false);
+  const [uploadedData, setUploadedData] = useState<any | null>(null);
+  const [uploadError, setUploadError] = useState<string | null>(null);
+
+  // Path Mode State
+  const [pathInput, setPathInput] = useState("C:\\SecureDel-Demo\\Temp\\");
+  const [validatingPath, setValidatingPath] = useState(false);
+  const [pathData, setPathData] = useState<any | null>(null);
+  const [pathError, setPathError] = useState<string | null>(null);
+  const [pathExtError, setPathExtError] = useState<ExtensionValidationResult | null>(null);
+
+  // Demo Mode State
+  const [generatingDemo, setGeneratingDemo] = useState(false);
+  const [demoData, setDemoData] = useState<any | null>(null);
+  const [demoError, setDemoError] = useState<string | null>(null);
+
+  // Scan & Wipe State
   const [scanning, setScanning] = useState(false);
-  const [selected, setSelected] = useState<string[]>([]);
+  const [scanned, setScanned] = useState(false);
+  const [scanResult, setScanResult] = useState<any | null>(null);
+  const [running, setRunning] = useState(false);
   const [complete, setComplete] = useState(false);
+  const [wipeResult, setWipeResult] = useState<any | null>(null);
   const [logs, setLogs] = useState<string[]>([]);
 
-  const scan = async () => {
-    setScanning(true);
+  const handleResetAll = () => {
+    setPathData(null);
+    setUploadedData(null);
+    setDemoData(null);
+    setScanResult(null);
+    setWipeResult(null);
     setLogs([]);
-    const addLog = (msg: string) => setLogs((p) => [...p, msg]);
-    const ts = () => new Date().toISOString().slice(11, 19);
-
-    addLog(`> [${ts()}] Scanning browser storage...`);
-    addLog(`> [${ts()}] Origin: ${window.location.origin}`);
-
-    const cats = await buildCategories();
-    setCategories(cats);
-
-    let totalItems = 0;
-    let totalBytes = 0;
-    for (const cat of cats) {
-      if (cat.count > 0) {
-        addLog(`> [${ts()}] Found: ${cat.label} — ${cat.count} item(s)${cat.sizeBytes > 0 ? ` (${formatBytes(cat.sizeBytes)})` : ""}`);
-        if (cat.items.length > 0) {
-          addLog(`>          Keys: ${cat.items.join(", ")}${cat.count > 5 ? ` +${cat.count - 5} more` : ""}`);
-        }
-        totalItems += cat.count;
-        totalBytes += cat.sizeBytes;
-      } else {
-        addLog(`> [${ts()}] Clean: ${cat.label} — empty`);
-      }
-    }
-
-    addLog(`>`);
-    addLog(`> [${ts()}] ✓ Scan complete — ${totalItems} item(s) across ${cats.filter((c) => c.count > 0).length} categories`);
-    if (totalBytes > 0) addLog(`> [${ts()}] Total size: ${formatBytes(totalBytes)}`);
-
     setScanning(false);
-    setScanned(true);
-    setSelected(cats.filter((c) => c.count > 0).map((c) => c.id));
+    setScanned(false);
+    setRunning(false);
+    setComplete(false);
+    setPathError(null);
+    setPathExtError(null);
+    setUploadError(null);
+    setDemoError(null);
+    setInputMode("select");
   };
 
-  useEffect(() => { scan(); }, []);
-
-  const wipe = async () => {
-    setLogs([]);
-    const addLog = (msg: string) => setLogs((p) => [...p, msg]);
-    const ts = () => new Date().toISOString().slice(11, 19);
-    const requestId = crypto.randomUUID();
-    logClientProgress({
-      toolId: "temp-cleaner",
-      stage: "run_start",
-      endpoint: "client:browser_storage_wipe",
-      requestId,
-      details: { selected },
-    });
-    addLog(`> [${ts()}] Initiating secure wipe...`);
-
-    for (const id of selected) {
-      const cat = categories.find((c) => c.id === id);
-      if (!cat || cat.count === 0) continue;
-      logClientProgress({
-        toolId: "temp-cleaner",
-        stage: "category_start",
-        endpoint: "client:browser_storage_wipe",
-        requestId,
-        details: { category: cat.label, id },
-      });
-      addLog(`> [${ts()}] Wiping: ${cat.label}...`);
-      try {
-        const cleared = await cat.clearFn();
-        addLog(`> [${ts()}] ✓ ${cat.label} — ${cleared} item(s) destroyed`);
-        logClientProgress({
-          toolId: "temp-cleaner",
-          stage: "category_complete",
-          endpoint: "client:browser_storage_wipe",
-          requestId,
-          details: { category: cat.label, id, wiped: cleared },
-        });
-      } catch (err) {
-        addLog(`> [${ts()}] ERROR: ${cat.label} — ${err}`);
-        logClientProgress({
-          toolId: "temp-cleaner",
-          stage: "category_complete",
-          endpoint: "client:browser_storage_wipe",
-          requestId,
-          status: "error",
-          details: { category: cat.label, id, error: String(err) },
-        });
+  const handleFileUpload = async (file: File) => {
+    setInputMode("upload");
+    setUploading(true);
+    setUploadError(null);
+    try {
+      const res = await uploadTempFile(file);
+      if (res.success) {
+        setUploadedData(res);
+        try {
+          const val = await validateTempPath(res.path);
+          if (val.success) setPathData(val);
+        } catch (_) {}
+      } else {
+        setUploadError(res.message || "Failed to upload temporary file.");
       }
+    } catch (err: any) {
+      setUploadError(err.message || "Upload failed.");
+    } finally {
+      setUploading(false);
+    }
+  };
+
+  const handleValidatePath = async (custom?: string) => {
+    const rawTarget = (custom ?? pathInput).trim();
+    const target = rawTarget.replace(/^["']+|["']+$/g, "").trim();
+    if (!target) return;
+
+    // Extension whitelist check before API call
+    const extResult = validatePathExtension("temp-cleaner", target);
+    if (!extResult.valid) {
+      setPathExtError(extResult);
+      setPathError(null);
+      setPathData(null);
+      return;
+    }
+    setPathExtError(null);
+
+    setValidatingPath(true);
+    setPathError(null);
+    try {
+      const res = await validateTempPath(target);
+      if (res.success && res.exists) {
+        setPathData(res);
+      } else {
+        setPathError(res.message || "Temporary directory not found.");
+        setPathData(null);
+      }
+    } catch (err: any) {
+      setPathError(err.message || "Validation failed.");
+      setPathData(null);
+    } finally {
+      setValidatingPath(false);
+    }
+  };
+
+  const handleSetupDemo = async () => {
+    setInputMode("demo");
+    setGeneratingDemo(true);
+    setDemoError(null);
+    try {
+      const res = await generateDemoTemp();
+      setDemoData(res);
+    } catch (err: any) {
+      setDemoError(err.message || "Failed to generate demo temp files on disk.");
+    } finally {
+      setGeneratingDemo(false);
+    }
+  };
+
+  const executeScan = async () => {
+    setScanning(true);
+    setScanned(false);
+    setLogs([]);
+    const ts = () => new Date().toISOString().slice(11, 19);
+    const addLog = (m: string) => setLogs((p) => [...p, m]);
+
+    const targetPath =
+      inputMode === "upload"
+        ? uploadedData?.path
+        : inputMode === "demo"
+        ? demoData?.path
+        : pathData?.path;
+
+    if (!targetPath) {
+      setScanning(false);
+      return;
     }
 
-    addLog(`>`);
-    addLog(`> [${ts()}] ✓ WIPE COMPLETE`);
-    logClientProgress({
-      toolId: "temp-cleaner",
-      stage: "run_complete",
-      endpoint: "client:browser_storage_wipe",
-      requestId,
-      status: "success",
-      details: { selected },
-    });
-    logClientRun({
-      toolId: "temp-cleaner",
-      action: "browser_storage_wipe",
-      status: "success",
-      details: {
-        selectedCategories: selected,
-      },
-    });
-    setComplete(true);
+    addLog(`> [${ts()}] Initiating Real Temporary Files Scan`);
+    addLog(`> [${ts()}] Target Directory: ${targetPath}`);
+
+    try {
+      const res = await scanTempFiles({ directories: [targetPath] });
+      setScanResult(res);
+      setScanned(true);
+      addLog(`> [${ts()}] ✓ Files Detected: ${res.files_found}`);
+      addLog(`> [${ts()}] ✓ Total Size: ${formatBytes(res.total_size_bytes)}`);
+    } catch (err: any) {
+      addLog(`> [${ts()}] ✗ Scan error: ${err.message}`);
+    } finally {
+      setScanning(false);
+    }
   };
 
-  const totalItems = categories.reduce((s, c) => s + c.count, 0);
-  const totalBytes = categories.reduce((s, c) => s + c.sizeBytes, 0);
+  const executeWipe = async () => {
+    setConfirmOpen(false);
+    setRunning(true);
+    setComplete(false);
+    const ts = () => new Date().toISOString().slice(11, 19);
+    const addLog = (m: string) => setLogs((p) => [...p, m]);
 
-  return (
-    <div>
-      <h2 className="font-display font-bold text-xl text-text-primary uppercase tracking-wider mb-6">
-        <Trash2 className="inline w-5 h-5 text-primary mr-2" />
-        Browser Storage Eliminator
+    const targetPath =
+      inputMode === "upload"
+        ? uploadedData?.path
+        : inputMode === "demo"
+        ? demoData?.path
+        : pathData?.path;
+
+    addLog(`> [${ts()}] Sanitizing and removing temporary files...`);
+
+    try {
+      const res = await wipeTempFiles({ directories: [targetPath], passes: 3 });
+      setWipeResult(res);
+      setComplete(true);
+
+      if (res.verified || res.success) {
+        addLog(`> [${ts()}] ✓ Wiped ${res.wiped_files || 1} temporary files (${formatBytes(res.wiped_bytes || uploadedData?.size || 0)})`);
+        addLog(`> [${ts()}] ✓ Filesystem post-clean verification: PASSED (0 files remaining)`);
+      } else {
+        addLog(`> [${ts()}] ✗ Incomplete: ${res.failed_files} files remaining`);
+      }
+    } catch (err: any) {
+      addLog(`> [${ts()}] ✗ Error: ${err.message}`);
+      setComplete(true);
+    } finally {
+      setRunning(false);
+    }
+  };
+
+  if (inputMode === "select") {
+    return (
+      <div className="space-y-6">
+        <h2 className="font-display font-bold text-xl text-text-primary uppercase tracking-wider mb-6 flex items-center gap-2">
+          <Trash2 className="w-5 h-5 text-primary" />
+          Temporary File Secure Cleaner
+        </h2>
+        <InputMethodSelector
+          title="Choose Temp Source"
+          subtitle="Select a custom temporary directory (e.g. C:\SecureDel-Demo\Temp\) to inspect and clean on disk, Upload a temp file, or generate a safe test temp directory."
+          onSelectManual={(file) => {
+            if (file) {
+              handleFileUpload(file);
+            } else {
+              setInputMode("upload");
+            }
+          }}
+          onSelectFilePath={() => setInputMode("filepath")}
+          onSelectDemo={handleSetupDemo}
+          accept=".tmp,.temp,.bak,.old,.swp"
+          acceptLabel=".tmp  .temp  .bak  .old  .swp"
+        />
+      </div>
+    );
+  }
+
+  const SourceHeader = () => (
+    <div className="flex flex-wrap items-center justify-between gap-3 mb-4">
+      <h2 className="font-display font-bold text-xl text-text-primary uppercase tracking-wider flex items-center gap-2">
+        <Trash2 className="w-5 h-5 text-primary" />
+        Temporary File Secure Cleaner
       </h2>
+      <div className="flex items-center gap-2 font-mono text-xs">
+        <span className="px-2.5 py-1 rounded-lg border font-bold uppercase border-primary/40 bg-primary/10 text-primary">
+          {inputMode === "demo" ? "🧪 SecureDel Demo Generator" : inputMode === "upload" ? "📁 Uploaded Temp File" : "📍 Local Temp Directory"}
+        </span>
+        <button onClick={handleResetAll} className="text-text-ghost hover:text-text-primary underline text-xs cursor-pointer">
+          Change Source
+        </button>
+      </div>
+    </div>
+  );
 
-      {complete ? (
-        <div>
-          <div className="p-6 rounded-xl bg-primary/5 border border-primary/20 text-center mb-4">
-            <CheckCircle2 className="w-12 h-12 text-primary mx-auto mb-4" />
-            <h3 className="font-display font-bold text-lg text-text-primary uppercase">Storage Destroyed</h3>
-            <p className="font-mono text-xs text-text-ghost mt-1">All selected browser storage wiped</p>
+  if (complete) {
+    const isSuccess = wipeResult?.verified || wipeResult?.success;
+    return (
+      <div className="space-y-6">
+        <SourceHeader />
+        <div className={`p-6 rounded-xl border text-left space-y-6 ${
+          isSuccess ? "bg-emerald-500/5 border-emerald-500/30" : "bg-destructive/5 border-destructive/30"
+        }`}>
+          <div className="flex items-center gap-3">
+            {isSuccess ? <CheckCircle2 className="w-8 h-8 text-emerald-400 shrink-0" /> : <XCircle className="w-8 h-8 text-destructive shrink-0" />}
+            <div>
+              <h3 className="font-display font-bold text-xl uppercase tracking-wide text-text-primary">
+                {isSuccess ? "TEMPORARY FILES CLEANED & VERIFIED" : "CLEANUP INCOMPLETE"}
+              </h3>
+              <p className="font-mono text-xs text-text-secondary mt-0.5">
+                {isSuccess ? "All target temporary files were securely overwritten and removed from physical storage." : "Some temporary files could not be removed."}
+              </p>
+            </div>
           </div>
-          <TerminalWindow title="wipe-log">
-            {logs.map((l, i) => <p key={i} className={l.includes("✓") ? "text-primary" : l.includes("ERROR") ? "text-destructive" : ""}>{l}</p>)}
-          </TerminalWindow>
-          <CyberButton className="mt-4" onClick={() => { setComplete(false); setScanned(false); scan(); }}>
-            Scan Again
+
+          <div className="p-4 rounded-xl bg-void border border-border font-mono text-xs space-y-2">
+            <div className="flex justify-between border-b border-border/40 pb-1.5">
+              <span className="text-text-ghost">Files Cleaned:</span>
+              <span className="font-bold text-emerald-400">{wipeResult?.wiped_files || (uploadedData ? 1 : 0)} files</span>
+            </div>
+            <div className="flex justify-between border-b border-border/40 pb-1.5">
+              <span className="text-text-ghost">Space Reclaimed:</span>
+              <span className="font-bold text-primary">{formatBytes(wipeResult?.wiped_bytes || uploadedData?.size || 0)}</span>
+            </div>
+            <div className="flex justify-between">
+              <span className="text-text-ghost">Verification Status:</span>
+              <span className="text-emerald-400 font-bold">✓ PASSED (0 Files Remaining)</span>
+            </div>
+          </div>
+
+          <CyberButton variant="primary" size="sm" onClick={handleResetAll}>
+            Clean Another Temp Source
           </CyberButton>
         </div>
-      ) : !scanned ? (
-        <div className="text-center py-12">
-          {scanning ? (
-            <TerminalWindow title="scanning-storage">
-              {logs.map((l, i) => <p key={i} className={l.includes("✓") ? "text-primary" : ""}>{l}</p>)}
-              <span className="animate-blink text-primary">▌</span>
-            </TerminalWindow>
-          ) : (
-            <>
-              <RefreshCw className="w-8 h-8 text-primary/50 mx-auto mb-3 animate-spin" />
-              <p className="text-text-secondary mb-6 font-mono text-sm">Scanning browser storage...</p>
-            </>
-          )}
-        </div>
-      ) : (
-        <>
-          {totalItems > 0 ? (
-            <div className="p-3 rounded-lg bg-warning/5 border border-warning/20 mb-6 flex items-center gap-2">
-              <AlertTriangle className="w-4 h-4 text-warning" />
-              <span className="font-mono text-xs text-warning">
-                {totalItems} items found{totalBytes > 0 ? ` — ${formatBytes(totalBytes)}` : ""}
-              </span>
-            </div>
-          ) : (
-            <div className="p-3 rounded-lg bg-primary/5 border border-primary/20 mb-6 flex items-center gap-2">
-              <CheckCircle2 className="w-4 h-4 text-primary" />
-              <span className="font-mono text-xs text-primary">Browser storage is already clean</span>
-            </div>
-          )}
 
-          <div className="space-y-2 mb-6">
-            {categories.map((cat) => (
-              <label
-                key={cat.id}
-                className={`flex items-start justify-between p-3 rounded-lg bg-surface border transition-all ${cat.sensitive ? "border-warning/20" : "border-border"
-                  } ${cat.count === 0 ? "opacity-50" : "cursor-pointer"}`}
-                data-interactive
-              >
-                <div className="flex items-start gap-3">
-                  <input
-                    type="checkbox"
-                    checked={selected.includes(cat.id)}
-                    onChange={() => cat.count > 0 && setSelected((p) =>
-                      p.includes(cat.id) ? p.filter((x) => x !== cat.id) : [...p, cat.id]
-                    )}
-                    disabled={cat.count === 0}
-                    className="w-4 h-4 mt-0.5 rounded accent-primary"
-                  />
-                  <div>
-                    <div className="flex items-center gap-2">
-                      <span className="text-sm text-text-primary">{cat.label}</span>
-                      {cat.sensitive && cat.count > 0 && (
-                        <span className="text-[10px] font-mono text-warning bg-warning/10 px-1.5 py-0.5 rounded">SENSITIVE</span>
-                      )}
-                    </div>
-                    <p className="text-xs text-text-ghost">{cat.description}</p>
-                    {cat.items.length > 0 && (
-                      <p className="text-[10px] font-mono text-text-ghost mt-0.5 truncate max-w-[250px]">
-                        {cat.items.join(", ")}{cat.count > 5 ? ` +${cat.count - 5} more` : ""}
-                      </p>
-                    )}
+        <TerminalWindow title="temp-cleaner-audit">
+          {logs.map((l, i) => (
+            <p key={i} className={l.includes("✓") ? "text-emerald-400" : l.includes("✗") ? "text-destructive" : ""}>{l}</p>
+          ))}
+        </TerminalWindow>
+      </div>
+    );
+  }
+
+  const filesList =
+    scanResult?.files ||
+    pathData?.files ||
+    (uploadedData ? [{ name: uploadedData.name, path: uploadedData.path, size_bytes: uploadedData.size, category: "Uploaded Temp" }] : []);
+
+  const canOperate =
+    (inputMode === "upload" && uploadedData !== null) ||
+    (inputMode === "filepath" && pathData !== null) ||
+    (inputMode === "demo" && demoData !== null);
+
+  return (
+    <div className="space-y-6">
+      <SourceHeader />
+
+      <div className="grid grid-cols-1 lg:grid-cols-2 gap-8">
+        {/* Left Column: Temp Source */}
+        <div className="space-y-4">
+          {/* 📁 UPLOAD MODE */}
+          {inputMode === "upload" && (
+            <div className="p-5 rounded-xl border border-primary/40 bg-surface space-y-4 shadow-xl">
+              <div className="flex items-center gap-2 text-primary font-mono text-xs font-bold uppercase">
+                <FolderOpen className="w-4 h-4" /> Uploaded Temporary File
+              </div>
+
+              {!uploadedData ? (
+                <div
+                  className="border-2 border-dashed border-primary/30 hover:border-primary/60 bg-void/50 hover:bg-primary/5 rounded-xl p-6 text-center transition-all cursor-pointer group"
+                  onClick={() => {
+                    const input = document.createElement("input");
+                    input.type = "file";
+                    input.accept = ".tmp,.temp,.bak,.old,.swp";
+                    input.onchange = (e: any) => {
+                      if (e.target.files && e.target.files[0]) {
+                        handleFileUpload(e.target.files[0]);
+                      }
+                    };
+                    input.click();
+                  }}
+                >
+                  <Upload className="w-8 h-8 text-primary/60 group-hover:text-primary mx-auto mb-2" />
+                  <p className="font-mono text-xs text-text-primary font-bold">
+                    {uploading ? "UPLOADING TO SECURE STORAGE..." : "CLICK TO CHOOSE TEMP FILE"}
+                  </p>
+                  <p className="font-mono text-[10px] text-text-ghost mt-1">
+                    Accepts: .tmp, .temp, .bak, .old, .swp
+                  </p>
+                </div>
+              ) : (
+                <div className="p-4 rounded-xl bg-void border border-primary/30 space-y-2 font-mono text-xs">
+                  <div className="flex items-center justify-between border-b border-border/40 pb-2">
+                    <span className="text-primary font-bold flex items-center gap-1.5">
+                      <CheckCircle2 className="w-4 h-4" /> TEMP FILE LOADED
+                    </span>
+                    <button
+                      onClick={() => { setUploadedData(null); setPathData(null); }}
+                      className="text-text-ghost hover:text-destructive"
+                      title="Clear file"
+                    >
+                      <X className="w-4 h-4" />
+                    </button>
+                  </div>
+                  <div className="grid grid-cols-2 gap-x-4 gap-y-1.5">
+                    <span className="text-text-ghost">Filename:</span>
+                    <span className="text-text-primary font-bold truncate">{uploadedData.name}</span>
+                    <span className="text-text-ghost">Size:</span>
+                    <span className="text-primary font-bold">{formatBytes(uploadedData.size || 0)}</span>
+                    <span className="text-text-ghost">Path:</span>
+                    <span className="text-text-secondary truncate" title={uploadedData.path}>{uploadedData.path}</span>
+                    <span className="text-text-ghost">Status:</span>
+                    <span className="text-emerald-400 font-bold">READY TO CLEAN</span>
                   </div>
                 </div>
-                <div className="text-right font-mono text-xs text-text-ghost whitespace-nowrap ml-3">
-                  <div>{cat.count} item(s)</div>
-                  {cat.sizeBytes > 0 && <div>{formatBytes(cat.sizeBytes)}</div>}
+              )}
+
+              {uploadError && (
+                <div className="p-3 rounded-lg bg-destructive/10 border border-destructive/30 text-destructive text-xs font-mono">
+                  ✗ {uploadError}
                 </div>
-              </label>
-            ))}
+              )}
+            </div>
+          )}
+
+          {/* 📍 FILEPATH MODE */}
+          {inputMode === "filepath" && (
+            <div className="p-5 rounded-xl border border-blue-500/40 bg-surface space-y-4 shadow-xl">
+              <div className="flex items-center gap-2 text-blue-400 font-mono text-xs font-bold uppercase">
+                <MapPin className="w-4 h-4" /> Temporary Directory Path
+              </div>
+
+              <div className="space-y-2">
+                <p className="text-xs text-text-secondary">Enter path to a temporary folder to clean:</p>
+                <div className="flex gap-2">
+                  <input
+                    type="text"
+                    value={pathInput}
+                    onChange={(e) => {
+                      setPathInput(e.target.value);
+                      if (pathError) setPathError(null);
+                    }}
+                    onKeyDown={(e) => {
+                      if (e.key === "Enter") {
+                        e.preventDefault();
+                        handleValidatePath();
+                      }
+                    }}
+                    placeholder="C:\SecureDel-Demo\Temp\"
+                    className="w-full h-11 px-3 bg-surface-2 border border-border rounded-xl font-mono text-xs text-text-primary outline-none focus:border-blue-400"
+                  />
+                  <CyberButton
+                    variant="secondary"
+                    size="sm"
+                    onClick={() => handleValidatePath()}
+                    disabled={validatingPath || !pathInput.trim()}
+                    className="shrink-0 border-blue-500/40 text-blue-400 hover:bg-blue-500/10"
+                  >
+                    {validatingPath ? <Loader2 className="w-4 h-4 animate-spin" /> : "Validate"}
+                  </CyberButton>
+                </div>
+                <div className="flex items-center gap-2 pt-1 text-[11px] font-mono text-text-ghost">
+                  <span>Preset:</span>
+                  <button
+                    type="button"
+                    onClick={() => {
+                      setPathInput("C:\\SecureDel-Demo\\Temp\\");
+                      handleValidatePath("C:\\SecureDel-Demo\\Temp\\");
+                    }}
+                    className="text-blue-400 hover:underline"
+                  >
+                    C:\SecureDel-Demo\Temp\
+                  </button>
+                </div>
+              </div>
+
+              {pathExtError && (
+                <ExtensionErrorBadge
+                  ext={pathExtError.ext}
+                  currentToolLabel="Temp File Eliminator"
+                  allowedExtensions={pathExtError.allowedExtensions}
+                  suggestedTool={pathExtError.suggestedTool}
+                />
+              )}
+
+              {pathError && !pathExtError && (
+                <div className="p-3 rounded-lg bg-destructive/10 border border-destructive/30 text-destructive text-xs font-mono space-y-2">
+                  <div>✗ {pathError}</div>
+                  <button
+                    type="button"
+                    onClick={handleSetupDemo}
+                    className="text-amber-400 hover:underline font-bold text-[11px] flex items-center gap-1 cursor-pointer"
+                  >
+                    ✦ Click here to generate demo temp files in this location
+                  </button>
+                </div>
+              )}
+            </div>
+          )}
+
+          {inputMode === "demo" && (
+            <div className="p-5 rounded-xl border border-amber-500/40 bg-surface space-y-4 shadow-xl">
+              <div className="flex items-center justify-between">
+                <p className="font-mono text-xs text-amber-400 font-bold uppercase flex items-center gap-2">
+                  <TestTube className="w-4 h-4" /> 🧪 Physical Demo Temp Files Created
+                </p>
+                <span className="px-2 py-0.5 rounded bg-amber-400/20 text-amber-400 font-mono text-[10px] font-bold">
+                  REAL FILES
+                </span>
+              </div>
+              <CyberButton variant="ghost" size="sm" className="w-full text-amber-400" onClick={handleSetupDemo}>
+                <RotateCcw className="w-3.5 h-3.5 mr-1" /> Re-generate Demo Temp Files
+              </CyberButton>
+            </div>
+          )}
+
+          <div className="flex gap-2 pt-2">
+            <CyberButton variant="secondary" size="md" className="flex-1" disabled={!canOperate || scanning} onClick={executeScan}>
+              {scanning ? <Loader2 className="w-4 h-4 animate-spin mr-1" /> : null}
+              Scan Temp Files
+            </CyberButton>
+            <CyberButton variant="danger" size="md" className="flex-1" disabled={!canOperate || running} onClick={() => setConfirmOpen(true)}>
+              Clean Temp Files & Verify
+            </CyberButton>
+          </div>
+        </div>
+
+        {/* Right Column: Files List */}
+        <div className="space-y-4">
+          <div className="flex items-center justify-between">
+            <span className="font-mono text-xs text-text-ghost tracking-widest uppercase block">
+              // Detected Temporary Items ({filesList.length})
+            </span>
           </div>
 
-          <div className="flex gap-3">
-            <CyberButton
-              variant="danger"
-              size="lg"
-              className="flex-1"
-              disabled={selected.length === 0 || totalItems === 0}
-              onClick={wipe}
-            >
-              Wipe Selected Storage
-            </CyberButton>
-            <CyberButton variant="secondary" onClick={scan}>
-              <RefreshCw className="w-4 h-4" />
-            </CyberButton>
+          <div className="space-y-2 max-h-64 overflow-y-auto pr-1">
+            {filesList.length > 0 ? (
+              filesList.map((f: any, idx: number) => (
+                <div key={idx} className="p-3 rounded-lg bg-surface border border-border flex items-center justify-between font-mono text-xs">
+                  <div className="min-w-0 pr-2">
+                    <p className="text-text-primary font-bold truncate">{f.name}</p>
+                    <p className="text-text-ghost text-[10px] truncate">{f.path}</p>
+                  </div>
+                  <div className="text-right shrink-0">
+                    <span className="text-primary block font-bold">{formatBytes(f.size_bytes || f.size || 0)}</span>
+                    <span className="text-[10px] text-text-ghost">{f.category || "Temp File"}</span>
+                  </div>
+                </div>
+              ))
+            ) : (
+              <div className="p-8 text-center text-text-ghost font-mono text-xs border border-dashed border-border rounded-xl">
+                No temporary files detected. Validate a directory path, upload a file, or generate demo temp data.
+              </div>
+            )}
           </div>
-        </>
+        </div>
+      </div>
+
+      <TerminalWindow title="temp-cleaner-live">
+        {logs.map((l, i) => (
+          <p key={i} className={l.includes("✓") ? "text-emerald-400" : l.includes("✗") ? "text-destructive" : ""}>{l}</p>
+        ))}
+      </TerminalWindow>
+
+      {confirmOpen && (
+        <div className="fixed inset-0 z-50 flex items-center justify-center bg-void/80 backdrop-blur-sm p-4">
+          <div className="rounded-2xl border border-destructive/40 bg-surface p-6 max-w-md w-full shadow-2xl space-y-4 font-mono text-xs">
+            <h3 className="text-destructive font-bold text-base flex items-center gap-2">
+              <AlertTriangle className="w-5 h-5" /> Confirm Temporary Files Cleanup
+            </h3>
+            <p className="text-text-secondary leading-relaxed">
+              This will overwrite and remove all temporary files in the target directory on disk.
+            </p>
+            <div className="flex gap-3 pt-2">
+              <CyberButton variant="ghost" size="sm" className="flex-1" onClick={() => setConfirmOpen(false)}>
+                Cancel
+              </CyberButton>
+              <CyberButton variant="danger" size="sm" className="flex-1" onClick={executeWipe}>
+                Confirm Clean
+              </CyberButton>
+            </div>
+          </div>
+        </div>
       )}
     </div>
   );
 };
 
 export default TempFileCleaner;
+

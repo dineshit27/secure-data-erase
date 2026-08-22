@@ -1,515 +1,515 @@
 import { useState } from "react";
-import { Key, AlertTriangle, FolderOpen, CheckCircle2, Download, X, Server, GitBranch } from "lucide-react";
+import {
+  Key,
+  AlertTriangle,
+  FolderOpen,
+  CheckCircle2,
+  XCircle,
+  MapPin,
+  TestTube,
+  RotateCcw,
+  Shield,
+  Loader2,
+  ShieldAlert,
+  GitBranch,
+  Upload,
+  X,
+} from "lucide-react";
 import { CyberButton } from "@/components/ui/CyberButton";
 import { TerminalWindow } from "@/components/ui/TerminalWindow";
-import { apiPost, apiGet, logClientRun, subscribeRunEvents, ToolProgressEvent, API_BASE } from "@/lib/api";
+import { InputMethodSelector } from "@/components/ui/InputMethodSelector";
+import {
+  validateRepoPath,
+  generateDemoRepo,
+  uploadRepoFile,
+  scanRepoSecrets,
+  remediateSecrets,
+  formatBytes,
+} from "@/lib/api";
+import { validatePathExtension, type ExtensionValidationResult } from "@/lib/extensionRules";
+import { ExtensionErrorBadge } from "@/components/ui/ExtensionErrorBadge";
 
-// ── Types ─────────────────────────────────────────────────────────
-interface SecretFinding {
-  file: string;
-  line: number;
-  type: string;
-  value: string;
-  confidence: "HIGH" | "MEDIUM" | "LOW";
-  context: string;
-}
+type InputMode = "select" | "upload" | "filepath" | "demo";
 
-// ── Client-side patterns (browser scan) ──────────────────────────
-const SECRET_PATTERNS: Array<{
-  type: string;
-  confidence: SecretFinding["confidence"];
-  regex: RegExp;
-}> = [
-    { type: "AWS Access Key", confidence: "HIGH", regex: /\bAKIA[0-9A-Z]{16}\b/g },
-    { type: "AWS Secret Key", confidence: "HIGH", regex: /(?:aws[_-]?secret|secret[_-]?access[_-]?key)\s*[=:]\s*['"]?([A-Za-z0-9/+=]{40})/gi },
-    { type: "OpenAI API Key", confidence: "HIGH", regex: /\bsk-[A-Za-z0-9]{20,}\b/g },
-    { type: "Anthropic API Key", confidence: "HIGH", regex: /\bsk-ant-[A-Za-z0-9\-_]{20,}\b/g },
-    { type: "GitHub Token", confidence: "HIGH", regex: /\bghp_[A-Za-z0-9]{36}\b/g },
-    { type: "GitHub OAuth", confidence: "HIGH", regex: /\bgho_[A-Za-z0-9]{36}\b/g },
-    { type: "Stripe Secret Key", confidence: "HIGH", regex: /\bsk_live_[A-Za-z0-9]{24,}\b/g },
-    { type: "Stripe Test Key", confidence: "MEDIUM", regex: /\bsk_test_[A-Za-z0-9]{24,}\b/g },
-    { type: "Twilio SID", confidence: "HIGH", regex: /\bAC[a-z0-9]{32}\b/g },
-    { type: "SendGrid Key", confidence: "HIGH", regex: /\bSG\.[A-Za-z0-9\-_]{22,}\.[A-Za-z0-9\-_]{43,}\b/g },
-    { type: "Private RSA Key", confidence: "HIGH", regex: /-----BEGIN RSA PRIVATE KEY-----/g },
-    { type: "Private EC Key", confidence: "HIGH", regex: /-----BEGIN EC PRIVATE KEY-----/g },
-    { type: "Private Key (generic)", confidence: "HIGH", regex: /-----BEGIN PRIVATE KEY-----/g },
-    { type: "OpenSSH Private Key", confidence: "HIGH", regex: /-----BEGIN OPENSSH PRIVATE KEY-----/g },
-    { type: "Database URL", confidence: "HIGH", regex: /(?:postgres|postgresql|mysql|mongodb(?:\+srv)?|redis):\/\/[^:\s"'`]+:[^@\s"'`]+@[^\s"'`]+/gi },
-    { type: "Database Password", confidence: "HIGH", regex: /(?:DB_PASS|DATABASE_PASSWORD|MYSQL_PASSWORD|POSTGRES_PASSWORD)\s*[=:]\s*['"]?([^\s'"]{6,})/gi },
-    { type: "Hardcoded Password", confidence: "HIGH", regex: /(?:password|passwd)\s*=\s*['"]([^'"]{6,})['"]/gi },
-    { type: "Generic Secret", confidence: "MEDIUM", regex: /(?:SECRET|TOKEN|PRIVATE_KEY|CLIENT_SECRET)\s*[=:]\s*['"]([A-Za-z0-9\-_=+/]{16,})['"]/gi },
-    { type: "Generic API Key", confidence: "MEDIUM", regex: /(?:API_KEY|APIKEY|ACCESS_KEY)\s*[=:]\s*['"]([A-Za-z0-9\-_]{16,})['"]/gi },
-    { type: "JWT Token", confidence: "MEDIUM", regex: /eyJ[A-Za-z0-9\-_=]+\.[A-Za-z0-9\-_=]+\.[A-Za-z0-9\-_.+/=]{10,}/g },
-    { type: "Basic Auth (URL)", confidence: "HIGH", regex: /https?:\/\/[^:\s"'`]+:[^@\s"'`]{4,}@/gi },
-  ];
-
-const TEXT_EXTENSIONS = new Set([
-  "js", "ts", "jsx", "tsx", "mjs", "cjs",
-  "py", "rb", "go", "java", "php", "cs", "cpp", "c", "h", "rs",
-  "sh", "bash", "zsh", "fish",
-  "env", "cfg", "conf", "config", "ini", "toml", "yaml", "yml", "json",
-  "tf", "hcl", "dockerfile", "makefile",
-  "txt", "md", "log",
-]);
-
-// ── Helpers ───────────────────────────────────────────────────────
-function isTextFile(name: string): boolean {
-  const ext = name.split(".").pop()?.toLowerCase() ?? "";
-  if (name.toLowerCase() === "dockerfile" || name.toLowerCase() === "makefile") return true;
-  return TEXT_EXTENSIONS.has(ext);
-}
-
-function redact(val: string): string {
-  const show = Math.min(6, Math.floor(val.length / 3));
-  return val.slice(0, show) + "█".repeat(Math.max(4, val.length - show));
-}
-
-function scanFileText(text: string, filename: string): SecretFinding[] {
-  const lines = text.split("\n");
-  const findings: SecretFinding[] = [];
-  lines.forEach((lineText, lineIdx) => {
-    for (const pattern of SECRET_PATTERNS) {
-      const regex = new RegExp(pattern.regex.source, pattern.regex.flags);
-      let m: RegExpExecArray | null;
-      while ((m = regex.exec(lineText)) !== null) {
-        const rawMatch = m[1] || m[0];
-        const duplicate = findings.some(
-          (f) => f.file === filename && f.line === lineIdx + 1 && f.type === pattern.type
-        );
-        if (!duplicate) {
-          findings.push({
-            file: filename,
-            line: lineIdx + 1,
-            type: pattern.type,
-            value: redact(rawMatch),
-            confidence: pattern.confidence,
-            context: lineText.trim().slice(0, 100),
-          });
-        }
-      }
-    }
-  });
-  return findings;
-}
-
-// ── Component ─────────────────────────────────────────────────────
 const SecretScanner = () => {
-  const [files, setFiles] = useState<File[]>([]);
+  const [inputMode, setInputMode] = useState<InputMode>("select");
+
+  // Upload Mode State
+  const [uploading, setUploading] = useState(false);
+  const [uploadedData, setUploadedData] = useState<any | null>(null);
+  const [uploadError, setUploadError] = useState<string | null>(null);
+
+  // Path Mode State
+  const [pathInput, setPathInput] = useState("C:\\SecureDel-Demo\\TestRepository\\");
+  const [validatingPath, setValidatingPath] = useState(false);
+  const [pathData, setPathData] = useState<any | null>(null);
+  const [pathError, setPathError] = useState<string | null>(null);
+  const [pathExtError, setPathExtError] = useState<ExtensionValidationResult | null>(null);
+
+  // Demo Mode State
+  const [generatingDemo, setGeneratingDemo] = useState(false);
+  const [demoData, setDemoData] = useState<any | null>(null);
+  const [demoError, setDemoError] = useState<string | null>(null);
+
+  // Scan & Remediation State
   const [scanning, setScanning] = useState(false);
   const [scanned, setScanned] = useState(false);
-  const [findings, setFindings] = useState<SecretFinding[]>([]);
+  const [scanResult, setScanResult] = useState<any | null>(null);
   const [logs, setLogs] = useState<string[]>([]);
+  const [remediating, setRemediating] = useState(false);
+  const [remediated, setRemediated] = useState(false);
 
-  // Backend state
-  const [backendEnabled, setBackendEnabled] = useState(false);
-  const [repoPath, setRepoPath] = useState("");
-  const [remediateAction, setRemediateAction] = useState<"redact" | "flag">("redact");
-  const [installHook, setInstallHook] = useState(false);
-  const [backendRunning, setBackendRunning] = useState(false);
-  const [backendResult, setBackendResult] = useState<any>(null);
-  const [availablePatterns, setAvailablePatterns] = useState<Record<string, any>>({});
+  const handleResetAll = () => {
+    setPathData(null);
+    setUploadedData(null);
+    setDemoData(null);
+    setScanResult(null);
+    setLogs([]);
+    setScanning(false);
+    setScanned(false);
+    setRemediated(false);
+    setPathError(null);
+    setPathExtError(null);
+    setUploadError(null);
+    setDemoError(null);
+    setInputMode("select");
+  };
 
-  // ── Load backend patterns when toggle is turned on ──
-  const handleBackendToggle = async () => {
-    const next = !backendEnabled;
-    setBackendEnabled(next);
-    if (next && Object.keys(availablePatterns).length === 0) {
-      try {
-        const data = await apiGet("/api/secrets/patterns");
-        setAvailablePatterns(data?.patterns ?? {});
-      } catch {
-        // backend not running yet — silently ignore
+  const handleFileUpload = async (file: File) => {
+    setInputMode("upload");
+    setUploading(true);
+    setUploadError(null);
+    try {
+      const res = await uploadRepoFile(file);
+      if (res.success) {
+        setUploadedData(res);
+        try {
+          const val = await validateRepoPath(res.path);
+          if (val.success) setPathData(val);
+        } catch (_) {}
+      } else {
+        setUploadError(res.message || "Failed to upload file for secret scanning.");
       }
+    } catch (err: any) {
+      setUploadError(err.message || "Upload failed.");
+    } finally {
+      setUploading(false);
     }
   };
 
-  const removeFile = (i: number) => {
-    setFiles((prev) => prev.filter((_, idx) => idx !== i));
-    setScanned(false);
-    setFindings([]);
-  };
+  const handleValidatePath = async (custom?: string) => {
+    const rawTarget = (custom ?? pathInput).trim();
+    const target = rawTarget.replace(/^["']+|["']+$/g, "").trim();
+    if (!target) return;
 
-  const pickFiles = () => {
-    const input = document.createElement("input");
-    input.type = "file";
-    input.multiple = true;
-    input.accept = Array.from(TEXT_EXTENSIONS).map((e) => `.${e}`).join(",");
-    input.onchange = (e) => {
-      const target = e.target as HTMLInputElement;
-      if (target.files) {
-        setFiles((prev) => [...prev, ...Array.from(target.files!)]);
-        setScanned(false);
-        setFindings([]);
+    // Extension whitelist check before API call
+    const extResult = validatePathExtension("secret-scanner", target);
+    if (!extResult.valid) {
+      setPathExtError(extResult);
+      setPathError(null);
+      setPathData(null);
+      return;
+    }
+    setPathExtError(null);
+
+    setValidatingPath(true);
+    setPathError(null);
+    try {
+      const res = await validateRepoPath(target);
+      if (res.success && res.exists) {
+        setPathData(res);
+      } else {
+        setPathError(res.message || "Repository directory not found.");
+        setPathData(null);
       }
-    };
-    input.click();
+    } catch (err: any) {
+      setPathError(err.message || "Validation failed.");
+      setPathData(null);
+    } finally {
+      setValidatingPath(false);
+    }
   };
 
-  // ── Browser-side scan ─────────────────────────────────────────
-  const startScan = async () => {
-    if (files.length === 0) return;
+  const handleSetupDemo = async () => {
+    setInputMode("demo");
+    setGeneratingDemo(true);
+    setDemoError(null);
+    try {
+      const res = await generateDemoRepo();
+      setDemoData(res);
+    } catch (err: any) {
+      setDemoError(err.message || "Failed to create demo repository on disk.");
+    } finally {
+      setGeneratingDemo(false);
+    }
+  };
+
+  const executeScan = async () => {
     setScanning(true);
     setScanned(false);
+    setRemediated(false);
     setLogs([]);
-    setFindings([]);
-    setBackendResult(null);
-    const addLog = (msg: string) => setLogs((p) => [...p, msg]);
     const ts = () => new Date().toISOString().slice(11, 19);
+    const addLog = (m: string) => setLogs((p) => [...p, m]);
 
-    addLog(`> [${ts()}] SecureDel Secret Scanner`);
-    addLog(`> [${ts()}] Files: ${files.length} — Patterns: ${SECRET_PATTERNS.length}`);
-    addLog(`>`);
+    const targetPath =
+      inputMode === "upload"
+        ? uploadedData?.path
+        : inputMode === "demo"
+        ? demoData?.path
+        : pathData?.path;
 
-    const allFindings: SecretFinding[] = [];
-
-    for (const file of files) {
-      if (!isTextFile(file.name)) {
-        addLog(`> [${ts()}] SKIP (binary): ${file.name}`);
-        continue;
-      }
-      addLog(`> [${ts()}] Scanning: ${file.name} (${(file.size / 1024).toFixed(1)} KB)`);
-      try {
-        const text = await file.text();
-        const found = scanFileText(text, file.name);
-        allFindings.push(...found);
-        if (found.length === 0) {
-          addLog(`> [${ts()}] ✓ ${file.name} — clean`);
-        } else {
-          const high = found.filter((f) => f.confidence === "HIGH").length;
-          addLog(`> [${ts()}] ⚠ ${file.name} — ${found.length} secret(s) (HIGH:${high})`);
-        }
-      } catch {
-        addLog(`> [${ts()}] ERROR reading ${file.name}`);
-      }
+    if (!targetPath) {
+      setScanning(false);
+      return;
     }
 
-    addLog(`>`);
-    addLog(`> [${ts()}] ══ Scan complete ══`);
-    addLog(`> [${ts()}] Total secrets found: ${allFindings.length}`);
-    addLog(`> [${ts()}] HIGH confidence: ${allFindings.filter((f) => f.confidence === "HIGH").length}`);
-
-    logClientRun({
-      toolId: "secret-scanner",
-      action: "browser_secret_scan",
-      status: "success",
-      details: {
-        files: files.length,
-        findings: allFindings.length,
-      },
-    });
-
-    setFindings(allFindings);
-    setScanning(false);
-    setScanned(true);
-  };
-
-  // ── Backend repo scan + remediate + optional hook install ─────
-  const runBackendScan = async () => {
-    if (!repoPath.trim()) return;
-    setBackendRunning(true);
-    setBackendResult(null);
-    const requestId = crypto.randomUUID();
-
-    const appendProgress = (progress: ToolProgressEvent) => {
-      if (progress.tool_id !== "secret-scanner") return;
-      if (progress.request_id !== requestId) return;
-      const d = progress.details as Record<string, any>;
-      setLogs((p) => [...p, `[backend:${progress.stage}] ${d.file ?? d.root ?? d.action ?? ""}`]);
-    };
-
-    const unsubscribe = subscribeRunEvents({ onProgress: appendProgress });
+    addLog(`> [${ts()}] Initiating Real Repository Secret Scanner`);
+    addLog(`> [${ts()}] Scanning Repository Root: ${targetPath}`);
 
     try {
-      // Step 1: scan repo folder
-      const scanData = await apiPost("/api/secrets/scan", {
-        root: repoPath.trim(),
-        fail_on_critical: false,
-        request_id: requestId,
-      });
+      const res = await scanRepoSecrets({ root: targetPath });
+      setScanResult(res);
+      setScanned(true);
 
-      // Step 2: remediate (redact or flag)
-      const fixData = await apiPost("/api/secrets/remediate", {
-        root: repoPath.trim(),
-        action: remediateAction,
-        passes: 3,
-        request_id: requestId,
-      });
-
-      // Step 3 (optional): install pre-commit hook
-      let hookData = null;
-      if (installHook) {
-        hookData = await apiPost("/api/secrets/install-hook", {
-          repo_root: repoPath.trim(),
-          server_url: API_BASE,
-          request_id: requestId,
-        });
-      }
-
-      setBackendResult({ scan: scanData, fix: fixData, hook: hookData });
+      addLog(`> [${ts()}] Total Secret Findings: ${res.total_findings}`);
+      addLog(`> [${ts()}] Critical: ${res.critical_count} | High: ${res.high_count} | Medium: ${res.medium_count}`);
+      addLog(`> [${ts()}] Scan completed against actual disk files.`);
     } catch (err: any) {
-      setBackendResult({ error: err?.message ?? "Backend unreachable. Is it running on localhost:8000?" });
+      addLog(`> [${ts()}] ✗ Scan failed: ${err.message || "Error"}`);
     } finally {
-      unsubscribe();
-      setBackendRunning(false);
+      setScanning(false);
     }
   };
 
-  // ── Export report ─────────────────────────────────────────────
-  const exportReport = () => {
-    const lines = [
-      "SecureDel Secret Scanner — Report",
-      `Generated: ${new Date().toISOString()}`,
-      `Files scanned: ${files.length}`,
-      `Total findings: ${findings.length}`,
-      "",
-    ];
-    for (const f of findings) {
-      lines.push(`[${f.confidence}] ${f.file}:${f.line} — ${f.type}`);
-      lines.push(`  Value: ${f.value}`);
-      lines.push(`  Context: ${f.context}`);
-      lines.push("");
+  const executeRemediation = async () => {
+    setRemediating(true);
+    const ts = () => new Date().toISOString().slice(11, 19);
+    const addLog = (m: string) => setLogs((p) => [...p, m]);
+
+    const targetPath =
+      inputMode === "upload"
+        ? uploadedData?.path
+        : inputMode === "demo"
+        ? demoData?.path
+        : pathData?.path;
+
+    try {
+      const res = await remediateSecrets({ root: targetPath, action: "redact" });
+      setRemediated(true);
+      addLog(`> [${ts()}] ✓ Remediated ${res.remediated_findings} secrets across ${res.files_modified} files`);
+      addLog(`> [${ts()}] ✓ Filesystem verification: PASSED`);
+    } catch (err: any) {
+      addLog(`> [${ts()}] ✗ Remediation failed: ${err.message}`);
+    } finally {
+      setRemediating(false);
     }
-    const blob = new Blob([lines.join("\n")], { type: "text/plain" });
-    const url = URL.createObjectURL(blob);
-    const a = document.createElement("a");
-    a.href = url;
-    a.download = "secrets-scan-report.txt";
-    a.click();
-    URL.revokeObjectURL(url);
   };
 
-  const criticalCount = findings.filter((f) => f.confidence === "HIGH").length;
-  const backendPatternList = Object.entries(availablePatterns).slice(0, 6);
-
-  // ── Scanning state ────────────────────────────────────────────
-  if (scanning) {
+  if (inputMode === "select") {
     return (
-      <div>
-        <h2 className="font-display font-bold text-xl text-text-primary uppercase tracking-wider mb-6">
-          <Key className="inline w-5 h-5 text-primary mr-2" />
-          Hardcoded Secret Detector
+      <div className="space-y-6">
+        <h2 className="font-display font-bold text-xl text-text-primary uppercase tracking-wider mb-6 flex items-center gap-2">
+          <Key className="w-5 h-5 text-primary" />
+          Secret Leakage Detector
         </h2>
-        <TerminalWindow title="secret-scanner">
-          {logs.map((l, i) => (
-            <p key={i} className={l.includes("✓") ? "text-primary" : l.includes("⚠") ? "text-warning" : ""}>{l}</p>
-          ))}
-          <span className="animate-blink text-primary">▌</span>
-        </TerminalWindow>
+        <InputMethodSelector
+          title="Choose Repository Source"
+          subtitle="Scan a real project or git repository directory (e.g. C:\SecureDel-Demo\TestRepository\) for hardcoded API keys, tokens, and credentials, Upload source code, or generate a real test repository on disk."
+          onSelectManual={(file) => {
+            if (file) {
+              handleFileUpload(file);
+            } else {
+              setInputMode("upload");
+            }
+          }}
+          onSelectFilePath={() => setInputMode("filepath")}
+          onSelectDemo={handleSetupDemo}
+          accept=".js,.ts,.py,.env,.json,.yaml,.yml,.toml,.php,.rb,.go,.sh,.tsx,.jsx,.cs,.java"
+          acceptLabel=".js .ts .py .env .json .yaml .yml .toml .php .rb .go .sh"
+        />
       </div>
     );
   }
 
-  // ── Main render ───────────────────────────────────────────────
-  return (
-    <div>
-      <h2 className="font-display font-bold text-xl text-text-primary uppercase tracking-wider mb-6">
-        <Key className="inline w-5 h-5 text-primary mr-2" />
-        Hardcoded Secret Detector
+  const SourceHeader = () => (
+    <div className="flex flex-wrap items-center justify-between gap-3 mb-4">
+      <h2 className="font-display font-bold text-xl text-text-primary uppercase tracking-wider flex items-center gap-2">
+        <Key className="w-5 h-5 text-primary" />
+        Secret Leakage Detector
       </h2>
+      <div className="flex items-center gap-2 font-mono text-xs">
+        <span className="px-2.5 py-1 rounded-lg border font-bold uppercase border-primary/40 bg-primary/10 text-primary">
+          {inputMode === "demo" ? "🧪 SecureDel Demo Generator" : inputMode === "upload" ? "📁 Uploaded Source File" : "📍 Local Repository Path"}
+        </span>
+        <button onClick={handleResetAll} className="text-text-ghost hover:text-text-primary underline text-xs cursor-pointer">
+          Change Source
+        </button>
+      </div>
+    </div>
+  );
 
-      {/* ── Browser-side file upload & scan ── */}
-      {!scanned && (
-        <div className="space-y-6">
-          <div
-            className="border-2 border-dashed border-primary/25 rounded-xl p-12 text-center hover:border-primary/50 transition-colors cursor-pointer"
-            onClick={pickFiles}
-            data-interactive
-          >
-            <FolderOpen className="w-8 h-8 text-primary/50 mx-auto mb-3" />
-            <p className="font-mono text-sm text-text-secondary">Click to select source files</p>
-            <p className="font-mono text-xs text-text-ghost mt-1">.js .ts .py .env .json .yaml .sh .conf and more</p>
-            <p className="font-mono text-xs text-text-ghost mt-1">Scans for {SECRET_PATTERNS.length} real secret patterns</p>
-          </div>
+  const canScan =
+    (inputMode === "upload" && uploadedData !== null) ||
+    (inputMode === "filepath" && pathData !== null) ||
+    (inputMode === "demo" && demoData !== null);
 
-          {files.length > 0 && (
-            <div className="space-y-1">
-              {files.map((f, i) => (
-                <div key={i} className="flex items-center justify-between px-3 py-2 rounded-lg bg-surface border border-border">
-                  <span className="font-mono text-sm text-text-primary">{f.name}</span>
-                  <div className="flex items-center gap-3">
-                    <span className="font-mono text-xs text-text-ghost">{(f.size / 1024).toFixed(1)} KB</span>
-                    <button onClick={() => removeFile(i)} className="text-text-ghost hover:text-destructive">
-                      <X className="w-3.5 h-3.5" />
+  return (
+    <div className="space-y-6">
+      <SourceHeader />
+
+      <div className="grid grid-cols-1 lg:grid-cols-2 gap-8">
+        {/* Left Column: Repository Source */}
+        <div className="space-y-4">
+          {/* 📁 UPLOAD MODE */}
+          {inputMode === "upload" && (
+            <div className="p-5 rounded-xl border border-primary/40 bg-surface space-y-4 shadow-xl">
+              <div className="flex items-center gap-2 text-primary font-mono text-xs font-bold uppercase">
+                <FolderOpen className="w-4 h-4" /> Uploaded Source Code File
+              </div>
+
+              {!uploadedData ? (
+                <div
+                  className="border-2 border-dashed border-primary/30 hover:border-primary/60 bg-void/50 hover:bg-primary/5 rounded-xl p-6 text-center transition-all cursor-pointer group"
+                  onClick={() => {
+                    const input = document.createElement("input");
+                    input.type = "file";
+                    input.accept = ".js,.ts,.py,.env,.json,.yaml,.yml,.toml,.php,.rb,.go,.sh,.tsx,.jsx,.cs,.java";
+                    input.onchange = (e: any) => {
+                      if (e.target.files && e.target.files[0]) {
+                        handleFileUpload(e.target.files[0]);
+                      }
+                    };
+                    input.click();
+                  }}
+                >
+                  <Upload className="w-8 h-8 text-primary/60 group-hover:text-primary mx-auto mb-2" />
+                  <p className="font-mono text-xs text-text-primary font-bold">
+                    {uploading ? "UPLOADING TO SECURE STORAGE..." : "CLICK TO CHOOSE SOURCE FILE"}
+                  </p>
+                  <p className="font-mono text-[10px] text-text-ghost mt-1">
+                    Accepts: .js, .ts, .py, .env, .json, .yaml, .yml, etc.
+                  </p>
+                </div>
+              ) : (
+                <div className="p-4 rounded-xl bg-void border border-primary/30 space-y-2 font-mono text-xs">
+                  <div className="flex items-center justify-between border-b border-border/40 pb-2">
+                    <span className="text-primary font-bold flex items-center gap-1.5">
+                      <CheckCircle2 className="w-4 h-4" /> SOURCE FILE LOADED
+                    </span>
+                    <button
+                      onClick={() => { setUploadedData(null); setPathData(null); }}
+                      className="text-text-ghost hover:text-destructive"
+                      title="Clear file"
+                    >
+                      <X className="w-4 h-4" />
                     </button>
                   </div>
+                  <div className="grid grid-cols-2 gap-x-4 gap-y-1.5">
+                    <span className="text-text-ghost">Filename:</span>
+                    <span className="text-text-primary font-bold truncate">{uploadedData.name}</span>
+                    <span className="text-text-ghost">Size:</span>
+                    <span className="text-primary font-bold">{formatBytes(uploadedData.size || 0)}</span>
+                    <span className="text-text-ghost">Path:</span>
+                    <span className="text-text-secondary truncate" title={uploadedData.path}>{uploadedData.path}</span>
+                    <span className="text-text-ghost">Status:</span>
+                    <span className="text-emerald-400 font-bold">READY TO SCAN</span>
+                  </div>
                 </div>
-              ))}
+              )}
+
+              {uploadError && (
+                <div className="p-3 rounded-lg bg-destructive/10 border border-destructive/30 text-destructive text-xs font-mono">
+                  ✗ {uploadError}
+                </div>
+              )}
             </div>
           )}
 
-          <CyberButton onClick={startScan} disabled={files.length === 0}>
-            Run Secret Scan
-          </CyberButton>
+          {/* 📍 FILEPATH MODE */}
+          {inputMode === "filepath" && (
+            <div className="p-5 rounded-xl border border-blue-500/40 bg-surface space-y-4 shadow-xl">
+              <div className="flex items-center gap-2 text-blue-400 font-mono text-xs font-bold uppercase">
+                <MapPin className="w-4 h-4" /> Local Repository Path
+              </div>
 
-          {/* ── Backend repo scan section ── */}
-          <div className="p-4 rounded-xl bg-surface border border-border">
-            <div className="flex items-center justify-between mb-3">
-              <span className="font-mono text-xs text-text-ghost uppercase tracking-widest flex items-center gap-2">
-                <Server className="w-3.5 h-3.5" />
-                // Backend Repo Scanner & Remediator
-              </span>
-              <button
-                onClick={handleBackendToggle}
-                className={`relative w-10 h-5 rounded-full transition-colors ${backendEnabled ? "bg-primary" : "bg-surface-2 border border-border"}`}
-                data-interactive
-              >
-                <span className={`absolute top-0.5 w-4 h-4 rounded-full bg-white transition-all ${backendEnabled ? "left-5" : "left-0.5"}`} />
-              </button>
-            </div>
-
-            {backendEnabled && (
-              <div className="space-y-3">
-                <p className="font-mono text-xs text-text-ghost">
-                  Enter your project folder path. The backend will walk all files, detect secrets, and remediate them before your next commit.
-                </p>
-
-                {/* Repo path input */}
-                <input
-                  type="text"
-                  value={repoPath}
-                  onChange={(e) => setRepoPath(e.target.value)}
-                  placeholder="e.g. C:\Users\dinesh\myproject  or  /home/user/myapp"
-                  className="w-full h-10 px-3 bg-surface-2 border border-border rounded-lg font-mono text-xs text-text-primary focus:border-primary/40 outline-none placeholder:text-text-ghost"
-                />
-
-                {/* Remediate action */}
+              <div className="space-y-2">
+                <p className="text-xs text-text-secondary">Enter path to a project or git repository folder:</p>
                 <div className="flex gap-2">
-                  {(["redact", "flag"] as const).map((act) => (
-                    <button
-                      key={act}
-                      onClick={() => setRemediateAction(act)}
-                      className={`px-3 py-1.5 rounded-lg font-mono text-xs border transition-all ${remediateAction === act
-                          ? "border-primary/40 bg-primary/10 text-primary"
-                          : "border-border bg-surface text-text-ghost hover:border-border/60"
-                        }`}
-                      data-interactive
-                    >
-                      {act === "redact" ? "Redact secrets" : "Flag only (no edit)"}
-                    </button>
-                  ))}
-                </div>
-
-                {/* Pre-commit hook toggle */}
-                <div className="flex items-center justify-between p-3 rounded-lg bg-surface-2 border border-border">
-                  <div className="flex items-center gap-2">
-                    <GitBranch className="w-3.5 h-3.5 text-text-ghost" />
-                    <span className="font-mono text-xs text-text-ghost">Install git pre-commit hook</span>
-                  </div>
-                  <button
-                    onClick={() => setInstallHook((v) => !v)}
-                    className={`relative w-10 h-5 rounded-full transition-colors ${installHook ? "bg-primary" : "bg-surface border border-border"}`}
-                    data-interactive
+                  <input
+                    type="text"
+                    value={pathInput}
+                    onChange={(e) => {
+                      setPathInput(e.target.value);
+                      if (pathError) setPathError(null);
+                    }}
+                    onKeyDown={(e) => {
+                      if (e.key === "Enter") {
+                        e.preventDefault();
+                        handleValidatePath();
+                      }
+                    }}
+                    placeholder="C:\SecureDel-Demo\TestRepository\"
+                    className="w-full h-11 px-3 bg-surface-2 border border-border rounded-xl font-mono text-xs text-text-primary outline-none focus:border-blue-400"
+                  />
+                  <CyberButton
+                    variant="secondary"
+                    size="sm"
+                    onClick={() => handleValidatePath()}
+                    disabled={validatingPath || !pathInput.trim()}
+                    className="shrink-0 border-blue-500/40 text-blue-400 hover:bg-blue-500/10"
                   >
-                    <span className={`absolute top-0.5 w-4 h-4 rounded-full bg-white transition-all ${installHook ? "left-5" : "left-0.5"}`} />
+                    {validatingPath ? <Loader2 className="w-4 h-4 animate-spin" /> : "Validate"}
+                  </CyberButton>
+                </div>
+                <div className="flex items-center gap-2 pt-1 text-[11px] font-mono text-text-ghost">
+                  <span>Preset:</span>
+                  <button
+                    type="button"
+                    onClick={() => {
+                      setPathInput("C:\\SecureDel-Demo\\TestRepository\\");
+                      handleValidatePath("C:\\SecureDel-Demo\\TestRepository\\");
+                    }}
+                    className="text-blue-400 hover:underline"
+                  >
+                    C:\SecureDel-Demo\TestRepository\
                   </button>
                 </div>
-                {installHook && (
-                  <p className="font-mono text-xs text-text-ghost px-1">
-                    Installs <code className="text-primary">.git/hooks/pre-commit</code> — blocks commits when critical secrets are found.
-                  </p>
-                )}
-
-                {/* Backend pattern count */}
-                {backendPatternList.length > 0 && (
-                  <p className="font-mono text-xs text-text-ghost">
-                    Backend patterns: {backendPatternList.map(([k, v]) => `${k} (${v.severity})`).join(", ")}
-                    {Object.keys(availablePatterns).length > 6 ? ` +${Object.keys(availablePatterns).length - 6} more` : ""}
-                  </p>
-                )}
-
-                <p className="font-mono text-xs text-destructive">
-                  ⚠ Requires backend running at localhost:8000.
-                  {remediateAction === "redact" ? " Secrets will be overwritten in source files." : ""}
-                </p>
-
-                <CyberButton
-                  variant="danger"
-                  onClick={runBackendScan}
-                  disabled={!repoPath.trim() || backendRunning}
-                >
-                  {backendRunning
-                    ? "Scanning..."
-                    : `Scan & ${remediateAction === "redact" ? "Redact" : "Flag"} Repo${installHook ? " + Install Hook" : ""}`}
-                </CyberButton>
-
-                {/* Backend result */}
-                {backendResult && (
-                  <div className="mt-3 p-3 rounded-lg bg-surface-2 border border-border font-mono text-xs space-y-1">
-                    {backendResult.error ? (
-                      <p className="text-destructive">✗ {backendResult.error}</p>
-                    ) : (
-                      <>
-                        <p className="text-primary">✓ Backend scan complete</p>
-                        <p className="text-text-secondary">
-                          Findings: {backendResult.scan?.total_findings ?? "—"} &nbsp;|&nbsp;
-                          Critical: {backendResult.scan?.by_severity?.critical ?? 0} &nbsp;|&nbsp;
-                          High: {backendResult.scan?.by_severity?.high ?? 0}
-                        </p>
-                        <p className="text-text-secondary">
-                          Remediated: {backendResult.fix?.files_processed ?? "—"} file(s) &nbsp;|&nbsp;
-                          Secrets fixed: {backendResult.fix?.total_secrets ?? "—"}
-                        </p>
-                        {backendResult.hook && (
-                          <p className={backendResult.hook.success ? "text-primary" : "text-destructive"}>
-                            Hook: {backendResult.hook.success ? `✓ Installed at ${backendResult.hook.hook_path}` : `✗ ${backendResult.hook.reason ?? backendResult.hook.error}`}
-                          </p>
-                        )}
-                      </>
-                    )}
-                  </div>
-                )}
               </div>
-            )}
-          </div>
-        </div>
-      )}
 
-      {/* ── Results ── */}
-      {scanned && (
-        <div>
-          {findings.length === 0 ? (
-            <div className="p-4 rounded-xl bg-primary/5 border border-primary/20 mb-6 flex items-center gap-3">
-              <CheckCircle2 className="w-5 h-5 text-primary" />
-              <span className="font-mono text-sm text-primary">
-                No secrets detected in {files.length} file(s) — {SECRET_PATTERNS.length} patterns checked
-              </span>
-            </div>
-          ) : (
-            <div className="p-4 rounded-xl bg-destructive/5 border border-destructive/20 mb-6 flex items-center gap-3">
-              <AlertTriangle className="w-5 h-5 text-destructive" />
-              <span className="font-mono text-sm text-destructive uppercase tracking-wider">
-                {criticalCount} HIGH-confidence secrets — {findings.length} total findings
-              </span>
+              {pathExtError && (
+                <ExtensionErrorBadge
+                  ext={pathExtError.ext}
+                  currentToolLabel="Secret Leak Detector"
+                  allowedExtensions={pathExtError.allowedExtensions}
+                  suggestedTool={pathExtError.suggestedTool}
+                />
+              )}
+
+              {pathError && !pathExtError && (
+                <div className="p-3 rounded-lg bg-destructive/10 border border-destructive/30 text-destructive text-xs font-mono space-y-2">
+                  <div>✗ {pathError}</div>
+                  <button
+                    type="button"
+                    onClick={handleSetupDemo}
+                    className="text-amber-400 hover:underline font-bold text-[11px] flex items-center gap-1 cursor-pointer"
+                  >
+                    ✦ Click here to generate demo repository in this location
+                  </button>
+                </div>
+              )}
+
+              {pathData && (
+                <div className="p-4 rounded-xl bg-void border border-blue-500/30 space-y-2 font-mono text-xs">
+                  <p className="text-blue-400 font-bold flex items-center gap-1.5">
+                    <CheckCircle2 className="w-4 h-4" /> REPOSITORY DETECTED
+                  </p>
+                  <div className="grid grid-cols-2 gap-x-4 gap-y-1.5">
+                    <span className="text-text-ghost">Files Scannable:</span>
+                    <span className="text-primary font-bold">{pathData.fileCount} source files</span>
+                    <span className="text-text-ghost">Git Repository:</span>
+                    <span className={pathData.isGitRepo ? "text-emerald-400 font-bold" : "text-text-secondary"}>
+                      {pathData.isGitRepo ? "YES (.git detected)" : "NO"}
+                    </span>
+                    <span className="text-text-ghost">Languages:</span>
+                    <span className="text-primary">{pathData.languages?.join(", ") || "Text"}</span>
+                  </div>
+                </div>
+              )}
             </div>
           )}
 
-          <div className="space-y-2 mb-6">
-            {findings.map((f, i) => (
-              <div key={i} className="flex items-start gap-3 p-3 rounded-lg bg-surface border border-border">
-                <span className="font-mono text-xs text-primary min-w-[120px] truncate">📄 {f.file}</span>
-                <span className="font-mono text-xs text-text-ghost min-w-[40px]">L{f.line}</span>
-                <span className="font-mono text-xs text-text-secondary flex-1 break-all">{f.value}</span>
-                <span className="text-[10px] font-mono text-warning bg-warning/10 px-1.5 py-0.5 rounded whitespace-nowrap">{f.type}</span>
-                <span className={`text-[10px] font-mono px-1.5 py-0.5 rounded whitespace-nowrap ${f.confidence === "HIGH" ? "text-destructive bg-destructive/10" :
-                    f.confidence === "MEDIUM" ? "text-warning bg-warning/10" : "text-text-ghost bg-surface-2"
-                  }`}>
-                  {f.confidence}
+          {inputMode === "demo" && (
+            <div className="p-5 rounded-xl border border-amber-500/40 bg-surface space-y-4 shadow-xl">
+              <div className="flex items-center justify-between">
+                <p className="font-mono text-xs text-amber-400 font-bold uppercase flex items-center gap-2">
+                  <TestTube className="w-4 h-4" /> 🧪 Physical Demo Repository Created
+                </p>
+                <span className="px-2 py-0.5 rounded bg-amber-400/20 text-amber-400 font-mono text-[10px] font-bold">
+                  REAL FILES
                 </span>
               </div>
-            ))}
-          </div>
+              <CyberButton variant="ghost" size="sm" className="w-full text-amber-400" onClick={handleSetupDemo}>
+                <RotateCcw className="w-3.5 h-3.5 mr-1" /> Re-generate Demo Repository
+              </CyberButton>
+            </div>
+          )}
 
-          <div className="flex gap-3 flex-wrap">
-            <CyberButton variant="secondary" onClick={exportReport}>
-              <Download className="w-4 h-4 mr-2 inline" />
-              Export Report
-            </CyberButton>
-            <CyberButton variant="secondary" onClick={() => { setScanned(false); setFiles([]); setFindings([]); setLogs([]); setBackendResult(null); }}>
-              Scan New Files
+          <div className="pt-2">
+            <CyberButton variant="danger" size="lg" className="w-full" disabled={!canScan || scanning} onClick={executeScan}>
+              {scanning ? <Loader2 className="w-4 h-4 animate-spin mr-2" /> : <ShieldAlert className="w-4 h-4 mr-2" />}
+              {scanning ? "Scanning Repository Files..." : "Scan Repository for Secret Leaks"}
             </CyberButton>
           </div>
         </div>
-      )}
+
+        {/* Right Column: Findings */}
+        <div className="space-y-4">
+          <div className="flex items-center justify-between">
+            <span className="font-mono text-xs text-text-ghost tracking-widest uppercase block">
+              // Secret Findings ({scanResult?.total_findings ?? 0})
+            </span>
+          </div>
+
+          {scanned && scanResult && (
+            <div className="p-4 rounded-xl bg-void border border-border font-mono text-xs space-y-3">
+              <div className="grid grid-cols-3 gap-2 text-center pb-2 border-b border-border/40">
+                <div className="p-2 rounded bg-destructive/10 border border-destructive/30">
+                  <p className="text-destructive font-bold">{scanResult.critical_count}</p>
+                  <p className="text-[10px] text-text-ghost">CRITICAL</p>
+                </div>
+                <div className="p-2 rounded bg-warning/10 border border-warning/30">
+                  <p className="text-warning font-bold">{scanResult.high_count}</p>
+                  <p className="text-[10px] text-text-ghost">HIGH</p>
+                </div>
+                <div className="p-2 rounded bg-surface-2 border border-border">
+                  <p className="text-text-secondary font-bold">{scanResult.medium_count}</p>
+                  <p className="text-[10px] text-text-ghost">MEDIUM</p>
+                </div>
+              </div>
+
+              <div className="space-y-2 max-h-64 overflow-y-auto pr-1">
+                {scanResult.findings?.map((f: any, idx: number) => (
+                  <div key={idx} className="p-2.5 rounded-lg bg-surface border border-border space-y-1">
+                    <div className="flex items-center justify-between">
+                      <span className="font-bold text-text-primary">{f.file} (Line {f.line})</span>
+                      <span className={`text-[10px] px-1.5 py-0.5 rounded font-bold ${
+                        f.severity === "CRITICAL" ? "bg-destructive/20 text-destructive" : "bg-warning/20 text-warning"
+                      }`}>{f.type}</span>
+                    </div>
+                    <p className="text-[11px] text-text-ghost break-all">{f.preview}</p>
+                  </div>
+                ))}
+              </div>
+
+              {scanResult.total_findings > 0 && !remediated && (
+                <CyberButton variant="secondary" size="sm" className="w-full text-xs" disabled={remediating} onClick={executeRemediation}>
+                  {remediating ? "Remediating..." : "Remediate & Redact Secrets in Repository"}
+                </CyberButton>
+              )}
+
+              {remediated && (
+                <div className="p-3 rounded-lg bg-emerald-500/10 border border-emerald-500/30 text-emerald-400 font-mono text-xs flex items-center gap-2">
+                  <CheckCircle2 className="w-4 h-4" />
+                  <span>✓ All detected secrets remediated and verified on disk.</span>
+                </div>
+              )}
+            </div>
+          )}
+
+          {!scanned && (
+            <div className="p-8 text-center text-text-ghost font-mono text-xs border border-dashed border-border rounded-xl">
+              No repository scan performed yet. Validate a path or upload a file and click Scan Repository.
+            </div>
+          )}
+        </div>
+      </div>
+
+      <TerminalWindow title="secret-scanner-live">
+        {logs.map((l, i) => (
+          <p key={i} className={l.includes("✓") ? "text-emerald-400" : l.includes("✗") ? "text-destructive" : ""}>{l}</p>
+        ))}
+      </TerminalWindow>
     </div>
   );
 };
